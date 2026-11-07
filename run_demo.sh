@@ -51,6 +51,32 @@ case "${1:-doctor}" in
   evaluate) shift; exec "$EVALUATE_BIN" --ros-args -p depth_topic:="$DEPTH_TOPIC" -p info_topic:="$INFO_TOPIC" -p stereo_reference_topic:="$STEREO_REFERENCE" -p stereo_info_topic:="$LEFT_INFO" -p collision_height:="${COLLISION_HEIGHT:-0.65}" "$@" ;;
   stereo) exec "$STEREO_BIN" "${STEREO_ARGS[@]}" ;;
   status) exec ros2 topic echo /thermalnav/status --once --full-length ;;
+  stereo-status)
+    nodes="$(ros2 node list --no-daemon 2>/dev/null)"
+    if ! grep -qx '/thermalnav_stereo' <<< "$nodes"; then
+      echo 'Stereo frontend is not running; no stereo matches can be published.' >&2
+      exit 2
+    fi
+    topics="$(ros2 topic list --no-daemon 2>/dev/null)"
+    missing=0
+    for topic in "$LEFT_TOPIC" "$RIGHT_TOPIC" "$LEFT_INFO" "$RIGHT_INFO"; do
+      if ! grep -qx "$topic" <<< "$topics"; then
+        echo "Missing stereo topic: $topic" >&2; missing=1; continue
+      fi
+      info="$(ros2 topic info --no-daemon "$topic" 2>/dev/null || true)"
+      if ! grep -Eq '^Publisher count: [1-9]' <<< "$info"; then
+        echo "No sensor publisher on stereo input: $topic" >&2; missing=1
+      fi
+    done
+    if [ "$missing" -ne 0 ]; then
+      echo 'Check CAMERA_RIG and launch the simulator with STEREO_RGB=1.' >&2
+      exit 3
+    fi
+    if ! timeout 5 ros2 topic echo /thermalnav/stereo/status --once --full-length; then
+      echo 'Stereo node exists but did not publish status within 5 s.' >&2
+      exit 4
+    fi
+    ;;
   start) exec ros2 service call /thermalnav/start std_srvs/srv/Trigger "{}" ;;
   build)
     cd "$ROOT"
@@ -115,7 +141,7 @@ case "${1:-doctor}" in
     echo 'Node ready. Inspect live state with: bash run_demo.sh status'
     wait "$(cat "$RUNTIME/demo.pid")"
     ;;
-  rviz) exec rviz2 -d "$ROOT/config/demo.rviz" ;;
+  rviz) exec rviz2 -d "$ROOT/config/demo.rviz" --ros-args -r "/thermalnav/rgb_proxy:=$LEFT_TOPIC" ;;
   stop)
     if alive demo; then
       timeout 5 ros2 service call /thermalnav/stop std_srvs/srv/Trigger '{}' >/dev/null || true
@@ -135,5 +161,5 @@ case "${1:-doctor}" in
     [ -x "$TEST_BIN" ] && [ -x "$DEMO_BIN" ] || { echo "Build with BUILD_TESTING=ON first" >&2; exit 2; }
     exec "$TEST_BIN" --binary "$DEMO_BIN" --tools-binary "$TOOLS_BIN" --stereo-binary "$STEREO_BIN" --evaluation-binary "$EVALUATE_BIN"
     ;;
-  *) echo 'Usage: bash run_demo.sh build|test|integration-test|doctor|observe|heuristic|vlm|rviz|status|start|stop|manual-check|validate|stereo|evaluate'; exit 2 ;;
+  *) echo 'Usage: bash run_demo.sh build|test|integration-test|doctor|observe|heuristic|vlm|rviz|status|stereo-status|start|stop|manual-check|validate|stereo|evaluate'; exit 2 ;;
 esac

@@ -8,11 +8,11 @@ C++17 / ROS2 主动探索 Demo：融合 Depth 与双目 RGB 灰度估计的稀�
 | --- | --- |
 | 双目灰度与匹配 | `/thermalnav/stereo/left_gray`、`right_gray`、`matches` |
 | 稀疏深度与置信度 | `/thermalnav/stereo/depth_sparse`、`confidence`、`points` |
-| 三维占据与二维 BEV | `/thermalnav/occupied_voxels`、`/thermalnav/bev` |
+| 三维占据与二维 BEV | `/thermalnav/occupied_voxels` 点云、`/thermalnav/bev` 二维导航 OccupancyGrid |
 | 相机观测覆盖 | `/thermalnav/coverage` |
 | 探索与人员目标 | 候选点、轨迹、目标标记及 `/goal_pose` |
 | 对照评测 | `/thermalnav/evaluation`：稀疏深度误差、参考地图完整度、错误自由格数量 |
-| 运行状态 | `/thermalnav/status`：输入来源、融合状态、耗时及探索进度 |
+| 运行状态 | `/thermalnav/status`：输入来源、融合状态、耗时及探索进度；`/thermalnav/stereo/status`：双目配对数与阻塞原因 |
 
 ## Pipeline
 
@@ -57,11 +57,14 @@ STEREO_RGB=1 CAMERA_RIG=d455f_twin612 bash ../go2_omniverse/commands/run_sim.sh
 
 ```bash
 CAMERA_RIG=d455f_twin612 MAPPING_SOURCE=fused bash run_demo.sh observe
-bash run_demo.sh rviz
+CAMERA_RIG=d455f_twin612 bash run_demo.sh rviz
+CAMERA_RIG=d455f_twin612 bash run_demo.sh stereo-status
 bash run_demo.sh start
 bash run_demo.sh status
 bash run_demo.sh stop
 ```
+
+`/thermalnav/bev` 是二维导航 OccupancyGrid；`/thermalnav/occupied_voxels` 是概率阈值以上的三维占据体素，包含观测到的地面表面，不能与 BEV 自由格逐格对照。两者同时显示时点云可能遮住地图。RViz 主地图使用 `/thermalnav/bev` OccupancyGrid。启动 `bash run_demo.sh rviz` 时，RGB proxy 会按 `CAMERA_RIG` 自动映射到对应左目：`legacy` 使用 `/robot0/front_cam/rgb`，`d455f_twin612` 使用 `/robot0/twin612_left/rgb`。BEV RGB preview 默认关闭，避免与主地图混淆。双目显示 `No Image` 时运行 `bash run_demo.sh stereo-status`：它检查前端节点和四个输入话题，并显示状态中的配对/时间戳/TF 阻塞原因。若状态有配对但 RViz 仍无图，再检查 RViz Image display 的 Topic 和 QoS。
 
 `MAPPING_SOURCE` 可选 `depth_only`、`stereo_only`、`fused`。`CAMERA_RIG=legacy` 使用原前置相机加右目。Go2 仿真保持 `use_sim_time=false`。
 

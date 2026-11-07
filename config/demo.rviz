@@ -9,7 +9,7 @@ Visualization Manager:
   Displays:
     - Class: rviz_default_plugins/Image
       Name: BEV RGB preview
-      Enabled: true
+      Enabled: false
       Topic:
         Value: /thermalnav/bev/rendered
         Reliability Policy: Reliable
@@ -73,7 +73,7 @@ Visualization Manager:
       Name: RGB Thermal proxy
       Enabled: true
       Topic:
-        Value: /robot0/front_cam/rgb
+        Value: /thermalnav/rgb_proxy
         Reliability Policy: Best Effort
   Views:
     Current:
