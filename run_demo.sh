@@ -8,7 +8,9 @@ if [ -f "$SRU_SETUP" ]; then source "$SRU_SETUP"; fi
 if [ "${1:-doctor}" != build ] && [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi
 DEMO_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav"
 TOOLS_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_tools"
-TEST_BIN="/tmp/thermalnav_cpp_build_colcon/thermalnav_demo/test_ros_runtime"
+BUILD_BASE="${THERMALNAV_BUILD_BASE:-/tmp/thermalnav_cpp_build_colcon_${UID}}"
+LOG_BASE="${THERMALNAV_LOG_BASE:-/tmp/thermalnav_colcon_log_${UID}}"
+TEST_BIN="$BUILD_BASE/thermalnav_demo/test_ros_runtime"
 STEREO_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_stereo"
 EVALUATE_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_evaluate"
 MAPPING_SOURCE="${MAPPING_SOURCE:-fused}"
@@ -52,7 +54,17 @@ case "${1:-doctor}" in
   start) exec ros2 service call /thermalnav/start std_srvs/srv/Trigger "{}" ;;
   build)
     cd "$ROOT"
-    colcon --log-base /tmp/thermalnav_colcon_log build --base-paths . --packages-select thermalnav_demo --build-base /tmp/thermalnav_cpp_build_colcon --install-base "$ROOT/install" --event-handlers console_direct+ --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE=/usr/bin/python3
+    # Isaac/Conda shells can leak incompatible CMAKE_PREFIX_PATH and runtime
+    # libraries into CMake's cache/link step. Build in a fresh, system ROS env.
+    env -i HOME="${HOME:-/home/carl}" USER="${USER:-carl}" PATH="/usr/bin:/bin" LANG="${LANG:-C.UTF-8}" \
+      bash --noprofile --norc -c '
+        set -e
+        source /opt/ros/humble/setup.bash
+        exec colcon --log-base "$1" build --base-paths . --packages-select thermalnav_demo \
+          --build-base "$2" --install-base "$3" --event-handlers console_direct+ \
+          --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE=/usr/bin/python3 \
+          -Dnlohmann_json_DIR=/usr/lib/cmake/nlohmann_json
+      ' thermalnav-build "$LOG_BASE" "$BUILD_BASE" "$ROOT/install"
     ;;
   heuristic|vlm|observe)
     [ -x "$DEMO_BIN" ] || { echo "Build the C++ runtime first: bash run_demo.sh build" >&2; exit 2; }
@@ -116,8 +128,8 @@ case "${1:-doctor}" in
     ;;
   test)
     cd "$ROOT"
-    colcon --log-base /tmp/thermalnav_colcon_log test --build-base /tmp/thermalnav_cpp_build_colcon --install-base "$ROOT/install" --packages-select thermalnav_demo --event-handlers console_direct+ --ctest-args -LE integration
-    colcon test-result --test-result-base /tmp/thermalnav_cpp_build_colcon --verbose
+    colcon --log-base "$LOG_BASE" test --build-base "$BUILD_BASE" --install-base "$ROOT/install" --packages-select thermalnav_demo --event-handlers console_direct+ --ctest-args -LE integration
+    colcon test-result --test-result-base "$BUILD_BASE" --verbose
     ;;
   integration-test)
     [ -x "$TEST_BIN" ] && [ -x "$DEMO_BIN" ] || { echo "Build with BUILD_TESTING=ON first" >&2; exit 2; }
