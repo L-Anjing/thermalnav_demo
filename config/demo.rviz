@@ -41,6 +41,28 @@ Visualization Manager:
       Marker Topic:
         Value: /thermalnav/markers
         Durability Policy: Transient Local
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Fused occupied voxels
+      Enabled: false
+      Topic:
+        Value: /thermalnav/occupied_voxels
+        Durability Policy: Transient Local
+      Size (m): 0.08
+      Style: Boxes
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Sparse stereo geometry
+      Enabled: true
+      Topic:
+        Value: /thermalnav/stereo/points
+        Reliability Policy: Best Effort
+      Size (m): 0.03
+      Style: Points
+    - Class: rviz_default_plugins/Image
+      Name: Stereo matches
+      Enabled: true
+      Topic:
+        Value: /thermalnav/stereo/matches
+        Reliability Policy: Reliable
     - Class: rviz_default_plugins/Path
       Name: Robot trajectory
       Enabled: true

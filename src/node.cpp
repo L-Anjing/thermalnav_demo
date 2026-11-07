@@ -1,5 +1,7 @@
 #include "thermalnav/core.hpp"
+#include "thermalnav/occupancy_fusion.hpp"
 #include "thermalnav/perception.hpp"
+#include "thermalnav/ros_observation.hpp"
 #include <chrono>
 #include <csignal>
 #include <cv_bridge/cv_bridge.h>
@@ -8,6 +10,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <iostream>
+#include <limits>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -48,9 +51,36 @@ public:
     stride_ = declare_parameter<int>("floor_stride", 2);
     max_range_ = declare_parameter<double>("max_range", 8.);
     reset_map_ = declare_parameter<bool>("reset_map_on_time_jump", true);
+    mapping_source_ =
+        declare_parameter<std::string>("mapping_source", "depth_only");
+    dropout_ = declare_parameter<double>("mapping_depth_dropout", 0.);
+    noise_ = declare_parameter<double>("mapping_depth_noise_sigma", 0.);
+    mapping_range_ = declare_parameter<double>("mapping_depth_max_range", 8.);
+    seed_ = declare_parameter<int>("mapping_seed", 42);
+    hole_fraction_ =
+        declare_parameter<double>("mapping_depth_hole_fraction", 0.);
+    if (!std::isfinite(hole_fraction_) || hole_fraction_ < 0 ||
+        hole_fraction_ > 1)
+      throw std::invalid_argument("invalid depth hole fraction");
+    if (mapping_source_ != "depth_only" && mapping_source_ != "stereo_only" &&
+        mapping_source_ != "fused")
+      throw std::invalid_argument("invalid mapping_source");
+    degradeDepth(cv::Mat1f(1, 1, 1.f), dropout_, noise_, mapping_range_, seed_);
+    FusionOptions options;
+    options.floor = floor_;
+    options.max_range = max_range_;
+    options.max_height = declare_parameter<double>("collision_height", .65);
+    fusion_ = std::make_unique<OccupancyFusion>(options);
+
     if (stride_ < 1 || !std::isfinite(floor_) || !std::isfinite(max_range_) ||
         max_range_ <= .15 || max_range_ > 30)
       throw std::invalid_argument("invalid mapper parameters");
+    depth_topic_ = declare_parameter<std::string>("mapping_depth_topic",
+                                                  "/robot0/front_cam/depth");
+    auto depth_info_topic = declare_parameter<std::string>(
+        "mapping_info_topic", "/robot0/front_cam/camera_info");
+    auto stereo_info_topic = declare_parameter<std::string>(
+        "stereo_info_topic", "/robot0/front_cam/camera_info");
     auto retained = rclcpp::QoS(1).transient_local().reliable();
     map_pub_ = create_publisher<Grid>("/thermalnav/bev", retained);
     cover_pub_ = create_publisher<Grid>("/thermalnav/coverage", retained);
@@ -67,8 +97,21 @@ public:
         create_publisher<std_msgs::msg::String>("/thermalnav/status", retained);
     goal_pub_ = create_publisher<Pose>("/goal_pose", 1);
     auto sensor = rclcpp::SensorDataQoS().keep_last(5);
+    voxel_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/thermalnav/occupied_voxels", retained);
+    sparse_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        "/thermalnav/stereo/points", sensor,
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud) {
+          double time = stamp(cloud->header);
+          if (time < last_stamp_ - .5)
+            resetEpoch(time);
+          sparse_frames_.push_back(cloud);
+          if (sparse_frames_.size() > 12)
+            sparse_frames_.pop_front();
+        });
+
     info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-        "/robot0/front_cam/camera_info", sensor,
+        depth_info_topic, sensor,
         [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
           cv::Matx33d K;
           std::copy(m->k.begin(), m->k.end(), K.val);
@@ -80,6 +123,19 @@ public:
           info_ = m;
           K_ = K;
         });
+    stereo_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+        stereo_info_topic, sensor,
+        [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
+          stereo_info_ = m;
+        });
+    detection_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+        "/robot0/front_cam/camera_info", sensor,
+        [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
+          detection_info_ = m;
+        });
+    detection_depth_sub_ = create_subscription<Image>(
+        "/robot0/front_cam/depth", sensor,
+        [this](Image::ConstSharedPtr m) { detection_depth_ = m; });
     rgb_sub_ = create_subscription<Image>("/robot0/front_cam/rgb", sensor,
                                           [this](Image::ConstSharedPtr m) {
                                             rgbs_.push_back(m);
@@ -87,13 +143,18 @@ public:
                                               rgbs_.pop_front();
                                           });
     depth_sub_ = create_subscription<Image>(
-        "/robot0/front_cam/depth", sensor, [this](Image::ConstSharedPtr m) {
+        depth_topic_, sensor, [this](Image::ConstSharedPtr m) {
           double s = stamp(m->header);
           if (last_received_stamp_ >= 0 && s < last_received_stamp_ - .5)
             resetEpoch(s);
           if (s <= last_stamp_ || (pending_ && s <= stamp(pending_->header)))
             return;
           last_received_stamp_ = s;
+          depth_frames_.push_back(m);
+          if (depth_frames_.size() > 20)
+            depth_frames_.pop_front();
+          if (!pending_)
+            pending_since_ = wall();
           pending_ = m;
         });
     odom_sub_ = create_subscription<Odom>(
@@ -136,6 +197,9 @@ public:
     tick_timer_ =
         create_wall_timer(std::chrono::seconds(1), [this] { tick(); });
     trajectory_.header.frame_id = "odom";
+    RCLCPP_INFO(get_logger(), "ROS domain=%zu mapping=%s",
+                get_node_base_interface()->get_context()->get_domain_id(),
+                mapping_source_.c_str());
     RCLCPP_INFO(get_logger(), "C++ runtime; detector: %s; policy: %s",
                 detector_.name.c_str(), policy_.status.c_str());
   }
@@ -155,10 +219,16 @@ private:
     return {odom_->pose.pose.position.x, odom_->pose.pose.position.y};
   }
   void resetEpoch(double s) {
+    last_received_stamp_ = s;
+    sparse_frames_.clear();
+    depth_frames_.clear();
+    if (reset_map_)
+      fusion_->clear();
     listener_.reset();
     tf_.clear();
     listener_ = std::make_unique<tf2_ros::TransformListener>(tf_);
     pending_.reset();
+    detection_depth_.reset();
     rgbs_.clear();
     odoms_.clear();
     tracks_.clear();
@@ -239,15 +309,58 @@ private:
         RCLCPP_WARN(get_logger(), "Detection unavailable: %s", e.what());
       }
     }
-    if (!pending_ || !info_ || !odom_ || odoms_.empty())
+
+    launchDetection();
+    auto camera = mapping_source_ == "stereo_only" ? stereo_info_ : info_;
+    if (!camera || !odom_ || odoms_.empty())
+
       return;
-    auto m = pending_;
+    Image::ConstSharedPtr m = pending_;
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr sparse;
+    if (mapping_source_ == "stereo_only") {
+      for (auto it = sparse_frames_.rbegin(); it != sparse_frames_.rend(); ++it)
+        if (stamp((*it)->header) > last_stamp_) {
+          sparse = *it;
+          break;
+        }
+      if (!sparse)
+        return;
+      if (!m || stamp(m->header) != stamp(sparse->header) ||
+          m->header.frame_id != camera->header.frame_id ||
+          m->width != camera->width || m->height != camera->height) {
+        auto anchor = std::make_shared<Image>();
+        anchor->header = sparse->header;
+        anchor->width = camera->width;
+        anchor->height = camera->height;
+        m = anchor;
+      }
+    }
+    if (mapping_source_ == "fused") {
+      for (auto cloud = sparse_frames_.rbegin();
+           cloud != sparse_frames_.rend() && !sparse; ++cloud) {
+        if (stamp((*cloud)->header) <= last_stamp_)
+          continue;
+        for (auto frame = depth_frames_.rbegin(); frame != depth_frames_.rend();
+             ++frame) {
+          if (rclcpp::Time((*cloud)->header.stamp) ==
+              rclcpp::Time((*frame)->header.stamp)) {
+            m = *frame;
+            sparse = *cloud;
+            break;
+          }
+        }
+      }
+      if (!sparse && (!m || wall() - pending_since_ < .3))
+        return;
+    }
+    if (!m)
+      return;
     if (stamp(m->header) <= last_stamp_) {
       pending_.reset();
       return;
     }
-    if (m->header.frame_id != info_->header.frame_id ||
-        m->width != info_->width || m->height != info_->height) {
+    if (m->header.frame_id != camera->header.frame_id ||
+        m->width != camera->width || m->height != camera->height) {
       blocked_ = "depth/info mismatch";
       pending_.reset();
       return;
@@ -262,6 +375,8 @@ private:
       blocked_ = "depth/odom time mismatch";
       return;
     }
+    cv::Matx33d K;
+    std::copy(camera->k.begin(), camera->k.end(), K.val);
     cv::Matx33d R;
     cv::Vec3d t;
     try {
@@ -283,21 +398,99 @@ private:
     cv::Mat1f depth;
     auto begin = Clock::now();
     try {
+
+      bool virtual_frame =
+          m->encoding.empty() && mapping_source_ == "stereo_only";
       if (m->encoding == "32FC1")
         depth = cv_bridge::toCvCopy(m, "32FC1")->image;
       else if (m->encoding == "16UC1")
         cv_bridge::toCvShare(m, "16UC1")->image.convertTo(depth, CV_32F, .001);
+      else if (virtual_frame)
+        depth = cv::Mat1f(m->height, m->width,
+                          std::numeric_limits<float>::quiet_NaN());
       else {
         blocked_ = "unsupported depth encoding " + m->encoding;
         return;
       }
-      const auto &p = nearest->pose.pose.position;
-      bev_.integrate(depth, K_, R, t, {p.x, p.y}, floor_, stride_, max_range_);
+      std::vector<Observation> observations;
+      cv::Mat1f measured =
+          degradeDepth(depth, dropout_, noise_, mapping_range_,
+                       seed_ + rclcpp::Time(m->header.stamp).nanoseconds());
+      if (hole_fraction_ > 0) {
+        int w = int(measured.cols * hole_fraction_),
+            h = int(measured.rows * hole_fraction_);
+        measured(
+            cv::Rect((measured.cols - w) / 2, (measured.rows - h) / 2, w, h))
+            .setTo(std::numeric_limits<float>::quiet_NaN());
+      }
+      size_t valid_depth = 0, stereo_count = 0;
+      if (mapping_source_ != "stereo_only") {
+        auto observation =
+            depthObservation(measured, K, R, t, stamp(m->header), max_range_,
+                             .0004 + noise_ * noise_);
+        valid_depth = observation.points.size();
+        observations.push_back(std::move(observation));
+      }
+      cv::Matx33d sparse_R;
+      cv::Vec3d sparse_t;
+      std::vector<DepthPoint> sparse_points;
+      if (sparse) {
+        auto pose = tf_.lookupTransform("odom", sparse->header.frame_id,
+                                        rclcpp::Time(sparse->header.stamp));
+        auto q = pose.transform.rotation;
+        auto p = pose.transform.translation;
+        sparse_R = rotation(q.x, q.y, q.z, q.w);
+        sparse_t = {p.x, p.y, p.z};
+        Observation observation;
+        observation.source = "stereo";
+        observation.stamp = stamp(sparse->header);
+        observation.R = sparse_R;
+        observation.origin = sparse_t;
+        sparse_points = readPoints(*sparse);
+        observation.points = sparse_points;
+        stereo_count = observation.points.size();
+        observations.push_back(std::move(observation));
+      }
+      bev_.diagnostics = fusion_->integrate(observations, bev_);
+      bev_.diagnostics["depth_pixels"] = depth.total();
+      bev_.diagnostics["valid_depth"] = valid_depth;
+      bev_.diagnostics["stereo_points"] = stereo_count;
+      bev_.diagnostics["stereo_status"] =
+          mapping_source_ == "depth_only" ? "disabled"
+          : sparse                        ? "paired"
+                                          : "unavailable: depth-only fallback";
+      // Coverage belongs to the inspection (stereo/thermal-proxy) camera.
+      // A wider, separately mounted depth camera cannot certify that coverage.
+      if (mapping_source_ != "stereo_only" &&
+          (stereo_info_ && stereo_info_->header.frame_id == m->header.frame_id))
+        bev_.observeCoverage(measured, K, R, t, floor_, max_range_);
+      else if (sparse && stereo_info_ &&
+               stereo_info_->header.frame_id == sparse->header.frame_id) {
+        cv::Matx33d sk;
+        std::copy(stereo_info_->k.begin(), stereo_info_->k.end(), sk.val);
+        cv::Mat1f raster(stereo_info_->height, stereo_info_->width,
+                         std::numeric_limits<float>::quiet_NaN());
+        for (const auto &p : sparse_points) {
+          if (p.p[2] <= 0)
+            continue;
+          auto uv = sk * p.p;
+          int x = cvRound(uv[0] / uv[2]), y = cvRound(uv[1] / uv[2]);
+          if (x >= 0 && y >= 0 && x < raster.cols && y < raster.rows)
+            raster(y, x) = p.p[2];
+        }
+        bev_.observeCoverage(raster, sk, sparse_R, sparse_t, floor_,
+                             max_range_);
+      }
+      bev_.blind_zone =
+          bev_.blindZone(K, R, t, m->width, m->height, robot(), floor_);
+      bev_.blind_zone["camera_frame"] = m->header.frame_id;
+      ++bev_.frames;
+      usable_depth_ = valid_depth > 0 || stereo_count > 0;
     } catch (const std::exception &e) {
       blocked_ = "mapping/decode: " + std::string(e.what());
       return;
     }
-    usable_depth_ = bev_.diagnostics.value("valid_depth", 0) > 0;
+
     map_ms_ =
         std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
     if (!proof_.is_null() && !bev_.certificate) {
@@ -323,40 +516,60 @@ private:
         blocked_.rfind("mapping/decode", 0) == 0 ||
         blocked_.rfind("unsupported depth", 0) == 0)
       blocked_.clear();
-    if (!rgbs_.empty() && !detection_.valid() &&
-        wall() - last_detect_wall_ > 2) {
-      auto rgb =
-          *std::min_element(rgbs_.begin(), rgbs_.end(), [&](auto a, auto b) {
-            return std::abs(stamp(a->header) - last_stamp_) <
-                   std::abs(stamp(b->header) - last_stamp_);
-          });
-      double rgb_skew = std::abs(stamp(rgb->header) - last_stamp_);
-      last_depth_["rgb_depth_skew_s"] = rgb_skew;
-      if (rgb_skew < .08 && rgb->header.frame_id == m->header.frame_id &&
-          rgb->width == m->width && rgb->height == m->height) {
-        try {
-          rgb_ = cv_bridge::toCvCopy(rgb, "bgr8")->image;
-          last_rgb_wall_ = wall();
-          auto image = rgb_.clone();
-          auto dep = depth.clone();
-          auto K = K_;
-          last_detect_wall_ = wall();
-          detection_stamp_ = stamp(rgb->header);
-          detection_epoch_ = epoch_;
-          detection_ =
-              std::async(std::launch::async, [this, image, dep, K, R, t] {
-                std::vector<XY> points;
-                for (const auto &box : detector_.detect(image)) {
-                  auto p = localizeBox(box, dep, K, R, t);
-                  if (p)
-                    points.emplace_back((*p)[0], (*p)[1]);
-                }
-                return points;
-              });
-        } catch (const std::exception &e) {
-          blocked_ = "RGB decode: " + std::string(e.what());
+  }
+
+  void launchDetection() {
+    if (rgbs_.empty() || detection_.valid() || wall() - last_detect_wall_ < 2 ||
+        !detection_info_ || !detection_depth_)
+      return;
+    auto depth = detection_depth_;
+    auto info = detection_info_;
+    if (depth->header.frame_id != info->header.frame_id ||
+        depth->width != info->width || depth->height != info->height)
+      return;
+    auto rgb =
+        *std::min_element(rgbs_.begin(), rgbs_.end(), [&](auto a, auto b) {
+          return std::abs(stamp(a->header) - stamp(depth->header)) <
+                 std::abs(stamp(b->header) - stamp(depth->header));
+        });
+    if (std::abs(stamp(rgb->header) - stamp(depth->header)) > .08 ||
+        rgb->header.frame_id != depth->header.frame_id ||
+        rgb->width != depth->width || rgb->height != depth->height)
+      return;
+    try {
+      cv::Mat1f dep;
+      if (depth->encoding == "32FC1")
+        dep = cv_bridge::toCvCopy(depth, "32FC1")->image;
+      else if (depth->encoding == "16UC1")
+        cv_bridge::toCvShare(depth, "16UC1")
+            ->image.convertTo(dep, CV_32F, .001);
+      else
+        return;
+      auto pose = tf_.lookupTransform("odom", depth->header.frame_id,
+                                      rclcpp::Time(depth->header.stamp));
+      auto q = pose.transform.rotation;
+      auto p = pose.transform.translation;
+      auto R = rotation(q.x, q.y, q.z, q.w);
+      cv::Vec3d t(p.x, p.y, p.z);
+      cv::Matx33d K;
+      std::copy(info->k.begin(), info->k.end(), K.val);
+      rgb_ = cv_bridge::toCvCopy(rgb, "bgr8")->image;
+      auto image = rgb_.clone();
+      last_rgb_wall_ = last_detect_wall_ = wall();
+      detection_stamp_ = stamp(rgb->header);
+      detection_epoch_ = epoch_;
+      detection_ = std::async(std::launch::async, [this, image, dep, K, R, t] {
+        std::vector<XY> points;
+        for (const auto &box : detector_.detect(image)) {
+          auto p = localizeBox(box, dep, K, R, t);
+          if (p)
+            points.emplace_back((*p)[0], (*p)[1]);
         }
-      }
+        return points;
+      });
+    } catch (const std::exception &e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                           "Detection waiting: %s", e.what());
     }
   }
   void goal(XY xy) {
@@ -583,6 +796,16 @@ private:
       publishStatus();
       return;
     }
+
+    std::vector<DepthPoint> occupied;
+    for (auto it = fusion_->tree().begin_leafs();
+         it != fusion_->tree().end_leafs(); ++it)
+      if (it->getOccupancy() >= .65)
+        occupied.push_back({{it.getX(), it.getY(), it.getZ()},
+                            float(it->getOccupancy()),
+                            0,
+                            false});
+    voxel_pub_->publish(pointCloud(occupied, map_header_));
     auto occ = bev_.occupancy();
     map_pub_->publish(grid(occ));
     cover_pub_->publish(grid(bev_.coverage(tracks_)));
@@ -647,6 +870,9 @@ private:
         scanned = cv::countNonZero((occ == 0) & (bev_.scanned != 0));
     Json status = {
         {"runtime", "cpp"},
+        {"mapping_source", mapping_source_},
+        {"mapping_depth_dropout", dropout_},
+        {"mapping_depth_noise_sigma", noise_},
         {"state", state_},
         {"enabled", enabled_},
         {"policy", policy_.status},
@@ -690,17 +916,34 @@ private:
     status_pub_->publish(m);
   }
   BEV bev_;
+  std::unique_ptr<OccupancyFusion> fusion_;
+  std::string mapping_source_;
+  double dropout_{}, noise_{}, mapping_range_{8.}, pending_since_{};
+  double hole_fraction_{};
+  int seed_{42};
+  std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> sparse_frames_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sparse_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr voxel_pub_;
+
   Renderer renderer_;
   tf2_ros::Buffer tf_;
   std::unique_ptr<tf2_ros::TransformListener> listener_;
   Policy policy_;
   Detector detector_;
-  sensor_msgs::msg::CameraInfo::ConstSharedPtr info_;
+  sensor_msgs::msg::CameraInfo::ConstSharedPtr info_, stereo_info_,
+      detection_info_;
+  Image::ConstSharedPtr detection_depth_;
+  std::string depth_topic_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr
+      stereo_info_sub_,
+      detection_info_sub_;
+  rclcpp::Subscription<Image>::SharedPtr detection_depth_sub_;
   cv::Matx33d K_;
   Odom::ConstSharedPtr odom_;
   std::deque<Odom::ConstSharedPtr> odoms_;
   Image::ConstSharedPtr pending_;
   std::deque<Image::ConstSharedPtr> rgbs_;
+  std::deque<Image::ConstSharedPtr> depth_frames_;
   cv::Mat3b rgb_;
   std::vector<Track> tracks_;
   std::vector<Candidate> candidates_;

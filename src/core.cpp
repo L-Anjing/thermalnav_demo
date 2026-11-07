@@ -196,6 +196,27 @@ void BEV::integrate(const cv::Mat1f &depth, const cv::Matx33d &K,
     }
   nearfield_stats = complete(stable, robot);
   blind_zone = blindZone(K, R, t, depth.cols, depth.rows, robot, floor);
+  observeCoverage(depth, K, R, t, floor, max_range);
+  ++frames;
+  auto occ = occupancy();
+  diagnostics = {{"depth_pixels", depth.total()},
+                 {"valid_depth", valid_count},
+                 {"ground_points", floors.size()},
+                 {"obstacle_points", hits.size()},
+                 {"free_endpoints_in_map", floors.size()},
+                 {"obstacle_endpoints_in_map", hits.size()},
+                 {"ray_cleared_cells", 0},
+                 {"observed_cells", cv::countNonZero(seen)},
+                 {"free_cells", cv::countNonZero(occ == 0)},
+                 {"occupied_cells", cv::countNonZero(occ == 100)},
+                 {"scanned_cells", cv::countNonZero(scanned)},
+                 {"occupancy_checksum", checksum(occ)},
+                 {"sensor_origin", {t[0], t[1], t[2]}}};
+}
+
+void BEV::observeCoverage(const cv::Mat1f &depth, const cv::Matx33d &K,
+                          const cv::Matx33d &R, const cv::Vec3d &t,
+                          double floor, double max_range) {
   auto occ = occupancy();
   for (int y = 0; y < log.rows; ++y)
     for (int x = 0; x < log.cols; ++x) {
@@ -219,20 +240,6 @@ void BEV::integrate(const cv::Mat1f &depth, const cv::Matx33d &K,
       if (all_valid && c[2] <= measured + .04)
         scanned(y, x) = 255;
     }
-  ++frames;
-  diagnostics = {{"depth_pixels", depth.total()},
-                 {"valid_depth", valid_count},
-                 {"ground_points", floors.size()},
-                 {"obstacle_points", hits.size()},
-                 {"free_endpoints_in_map", floors.size()},
-                 {"obstacle_endpoints_in_map", hits.size()},
-                 {"ray_cleared_cells", 0},
-                 {"observed_cells", cv::countNonZero(seen)},
-                 {"free_cells", cv::countNonZero(occ == 0)},
-                 {"occupied_cells", cv::countNonZero(occ == 100)},
-                 {"scanned_cells", cv::countNonZero(scanned)},
-                 {"occupancy_checksum", checksum(occ)},
-                 {"sensor_origin", {t[0], t[1], t[2]}}};
 }
 
 Json BEV::complete(const std::vector<cv::Vec3d> &points, XY robot) {

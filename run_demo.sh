@@ -5,45 +5,51 @@ export PYTHONNOUSERSITE=1 ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/thermalnav_ros}"
 source /opt/ros/humble/setup.bash
 SRU_SETUP="${SRU_SETUP:-$ROOT/../sru-robot-deployment/install/setup.bash}"
 if [ -f "$SRU_SETUP" ]; then source "$SRU_SETUP"; fi
-if [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi
+if [ "${1:-doctor}" != build ] && [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi
 DEMO_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav"
-export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
+TOOLS_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_tools"
+TEST_BIN="/tmp/thermalnav_cpp_build_colcon/thermalnav_demo/test_ros_runtime"
+STEREO_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_stereo"
+EVALUATE_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_evaluate"
+MAPPING_SOURCE="${MAPPING_SOURCE:-fused}"
+CAMERA_RIG="${CAMERA_RIG:-legacy}"
+case "$CAMERA_RIG" in
+  legacy)
+    DEPTH_TOPIC=/robot0/front_cam/depth; INFO_TOPIC=/robot0/front_cam/camera_info
+    LEFT_TOPIC=/robot0/front_cam/rgb; RIGHT_TOPIC=/robot0/front_cam_right/rgb
+    LEFT_INFO=/robot0/front_cam/camera_info; RIGHT_INFO=/robot0/front_cam_right/camera_info
+    STEREO_REFERENCE=/robot0/front_cam/depth ;;
+  d455f_twin612)
+    DEPTH_TOPIC=/robot0/d455f_depth/depth; INFO_TOPIC=/robot0/d455f_depth/camera_info
+    LEFT_TOPIC=/robot0/twin612_left/rgb; RIGHT_TOPIC=/robot0/twin612_right/rgb
+    LEFT_INFO=/robot0/twin612_left/camera_info; RIGHT_INFO=/robot0/twin612_right/camera_info
+    STEREO_REFERENCE=/robot0/twin612_left/depth_reference ;;
+  *) echo 'CAMERA_RIG must be legacy or d455f_twin612' >&2; exit 2 ;;
+esac
+STEREO_ARGS=(--ros-args -p left_topic:="$LEFT_TOPIC" -p right_topic:="$RIGHT_TOPIC" -p left_info_topic:="$LEFT_INFO" -p right_info_topic:="$RIGHT_INFO")
+
+case "$MAPPING_SOURCE" in depth_only|stereo_only|fused) ;; *) echo 'MAPPING_SOURCE must be depth_only, stereo_only or fused' >&2; exit 2;; esac
+
 RUNTIME="/tmp/thermalnav_demo_${UID}"
 mkdir -p "$RUNTIME"
 alive() {
     [ -f "$RUNTIME/$1.pid" ] || return 1
     local pid expected
     pid="$(cat "$RUNTIME/$1.pid")"
-    case "$1" in demo) expected="thermalnav.node|/lib/thermalnav_demo/thermalnav";; sru) expected='rl_nav_controller.rl_nav_controller';; sim) expected='thermalnav.sim_entry';; *) return 1;; esac
+    case "$1" in demo) expected="/lib/thermalnav_demo/thermalnav([[:space:]]|$)";; stereo) expected='/lib/thermalnav_demo/thermalnav_stereo([[:space:]]|$)';; sru) expected='rl_nav_controller.rl_nav_controller';; *) return 1;; esac
     kill -0 "$pid" 2>/dev/null && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Eq "$expected"
 }
 case "${1:-doctor}" in
-  stop-certified-sim)
-    if alive sim; then
-      pid="$(cat "$RUNTIME/sim.pid")"
-      if tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q 'thermalnav.sim_entry'; then kill -INT "$pid"; fi
-    fi
+  doctor|manual-check|validate)
+    task="${1:-doctor}"; if [ "$#" -gt 0 ]; then shift; fi
+    if [ "$task" = doctor ] && [ "${1:-}" = --startup ]; then task=startup-audit; shift; fi
+    [ -x "$TOOLS_BIN" ] || { echo 'Build the C++ tools first: bash run_demo.sh build' >&2; exit 2; }
+    exec "$TOOLS_BIN" --ros-args -p task:="$task" "$@"
     ;;
-  sim-certified)
-    if ros2 node list --no-daemon 2>/dev/null | grep -q '/go2_driver_node'; then
-      echo 'Existing Isaac Sim detected; refusing duplicate launch'; exit 1
-    fi
-    source "$ROOT/../go2_omniverse/IsaacSim-ros_workspaces/humble_ws/install/setup.bash"
-    source "$ROOT/../go2_omniverse/go2_omniverse_ws/install/setup.bash"
-    eval "$(/home/carl/miniforge3/condabin/conda shell.bash hook)"
-    conda activate env_isaaclab
-    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
-    export ISAAC_ASSETS_ROOT=/media/user/data1/isaac-sim-assets/merged/Assets/Isaac/4.5
-    cd "$ROOT/../go2_omniverse"
-    export PYTHONPATH="$PWD:$ROOT:${PYTHONPATH:-}"
-    echo $$ > "$RUNTIME/sim.pid"
-    exec python -u -m thermalnav.sim_entry --robot_type go2 --controller lab --policy_path checkpoints/moe_cts_lab/policy.pt --policy_config checkpoints/moe_cts_lab/config.yaml --headless --enable_cameras --custom_env hospital --cmd_source ros2 --device cuda
-    ;;
-  validate) exec /usr/bin/python3 -m thermalnav.validate ;;
-  manual-check) exec /usr/bin/python3 -m thermalnav.manual_check ;;
+  evaluate) shift; exec "$EVALUATE_BIN" --ros-args -p depth_topic:="$DEPTH_TOPIC" -p info_topic:="$INFO_TOPIC" -p stereo_reference_topic:="$STEREO_REFERENCE" -p stereo_info_topic:="$LEFT_INFO" -p collision_height:="${COLLISION_HEIGHT:-0.65}" "$@" ;;
+  stereo) exec "$STEREO_BIN" "${STEREO_ARGS[@]}" ;;
   status) exec ros2 topic echo /thermalnav/status --once --full-length ;;
   start) exec ros2 service call /thermalnav/start std_srvs/srv/Trigger "{}" ;;
-  doctor) shift; exec /usr/bin/python3 -m thermalnav.doctor "$@" ;;
   build)
     cd "$ROOT"
     colcon --log-base /tmp/thermalnav_colcon_log build --base-paths . --packages-select thermalnav_demo --build-base /tmp/thermalnav_cpp_build_colcon --install-base "$ROOT/install" --event-handlers console_direct+ --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE=/usr/bin/python3
@@ -57,6 +63,18 @@ case "${1:-doctor}" in
       echo '[ERROR] Isaac Sim is not publishing Go2 odom/depth. Start the existing simulator, then retry.' >&2
       exit 2
     fi
+    if [ "$MAPPING_SOURCE" != depth_only ]; then
+      [ -x "$STEREO_BIN" ] || { echo 'Build the stereo frontend first' >&2; exit 2; }
+      if ! grep -qx "$RIGHT_TOPIC" <<< "$topics"; then
+        if [ "$MAPPING_SOURCE" = stereo_only ]; then echo '[ERROR] Right RGB camera missing; start simulator with STEREO_RGB=1' >&2; exit 2; fi
+        echo '[WARN] Right RGB camera missing; fused mode will report depth-only fallback.' >&2
+      fi
+      if ! alive stereo && ! ros2 node list --no-daemon 2>/dev/null | grep -qx '/thermalnav_stereo'; then
+        "$STEREO_BIN" "${STEREO_ARGS[@]}" > "$RUNTIME/stereo.log" 2>&1 &
+        echo $! > "$RUNTIME/stereo.pid"
+      fi
+    fi
+    if ! grep -qx "$DEPTH_TOPIC" <<< "$topics"; then echo "[ERROR] Mapping depth missing: $DEPTH_TOPIC (check CAMERA_RIG on both terminals)" >&2; exit 2; fi
     # Never launch simulator here, and reuse an existing SRU controller.
     nodes="$(ros2 node list --no-daemon 2>/dev/null)"
     if ! grep -Eq 'navigation_policy_node|rl_nav_controller' <<< "$nodes"; then
@@ -70,7 +88,7 @@ case "${1:-doctor}" in
     fi
     mode="$1"; extra=()
     if [ "$mode" = observe ]; then mode=heuristic; extra=(-p observe:=true); fi
-    "$DEMO_BIN" --ros-args -p mode:="$mode" "${extra[@]}" > "$RUNTIME/demo.log" 2>&1 &
+    "$DEMO_BIN" --ros-args -p mode:="$mode" -p mapping_source:="$MAPPING_SOURCE" -p mapping_depth_topic:="$DEPTH_TOPIC" -p mapping_info_topic:="$INFO_TOPIC" -p stereo_info_topic:="$LEFT_INFO" -p mapping_depth_dropout:="${MAPPING_DEPTH_DROPOUT:-0.0}" -p mapping_depth_noise_sigma:="${MAPPING_DEPTH_NOISE_SIGMA:-0.0}" -p mapping_depth_hole_fraction:="${MAPPING_DEPTH_HOLE_FRACTION:-0.0}" -p mapping_depth_max_range:="${MAPPING_DEPTH_MAX_RANGE:-8.0}" -p collision_height:="${COLLISION_HEIGHT:-0.65}" "${extra[@]}" > "$RUNTIME/demo.log" 2>&1 &
     echo $! > "$RUNTIME/demo.pid"
     echo "ThermalNav PID=$! mode=$mode. Log: $RUNTIME/demo.log"
     echo 'Waiting for stamped RGB-D/odom/TF; startup status follows.'
@@ -92,14 +110,18 @@ case "${1:-doctor}" in
       kill -INT "$(cat "$RUNTIME/demo.pid")"
     fi
     sleep 2
+    if alive stereo; then kill -INT "$(cat "$RUNTIME/stereo.pid")"; fi
     if alive sru; then kill -INT "$(cat "$RUNTIME/sru.pid")"; fi
     echo 'Stopped only ThermalNav-owned processes; simulator untouched.'
     ;;
   test)
     cd "$ROOT"
-    colcon --log-base /tmp/thermalnav_colcon_log test --build-base /tmp/thermalnav_cpp_build_colcon --install-base "$ROOT/install" --packages-select thermalnav_demo --event-handlers console_direct+
+    colcon --log-base /tmp/thermalnav_colcon_log test --build-base /tmp/thermalnav_cpp_build_colcon --install-base "$ROOT/install" --packages-select thermalnav_demo --event-handlers console_direct+ --ctest-args -LE integration
     colcon test-result --test-result-base /tmp/thermalnav_cpp_build_colcon --verbose
     ;;
-  integration-test) exec /usr/bin/python3 "$ROOT/tests/test_ros_runtime.py" --binary "$DEMO_BIN" ;;
-  *) echo 'Usage: bash run_demo.sh doctor|heuristic|vlm|rviz|stop|build|test|observe'; exit 2 ;;
+  integration-test)
+    [ -x "$TEST_BIN" ] && [ -x "$DEMO_BIN" ] || { echo "Build with BUILD_TESTING=ON first" >&2; exit 2; }
+    exec "$TEST_BIN" --binary "$DEMO_BIN" --tools-binary "$TOOLS_BIN" --stereo-binary "$STEREO_BIN" --evaluation-binary "$EVALUATE_BIN"
+    ;;
+  *) echo 'Usage: bash run_demo.sh build|test|integration-test|doctor|observe|heuristic|vlm|rviz|status|start|stop|manual-check|validate|stereo|evaluate'; exit 2 ;;
 esac

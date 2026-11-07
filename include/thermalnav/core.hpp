@@ -45,6 +45,9 @@ public:
   void integrate(const cv::Mat1f &depth, const cv::Matx33d &K,
                  const cv::Matx33d &R, const cv::Vec3d &t, XY robot,
                  double floor = 0., int stride = 2, double max_range = 8.);
+  void observeCoverage(const cv::Mat1f &depth, const cv::Matx33d &K,
+                       const cv::Matx33d &R, const cv::Vec3d &t,
+                       double floor = 0., double max_range = 8.);
   Json complete(const std::vector<cv::Vec3d> &points, XY robot);
   Json blindZone(const cv::Matx33d &K, const cv::Matx33d &R, const cv::Vec3d &t,
                  int width, int height, XY robot, double floor) const;
