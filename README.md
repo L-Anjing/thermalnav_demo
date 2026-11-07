@@ -1,109 +1,127 @@
 # ThermalNav Demo
 
-Online RGB-D exploration adapter for the existing Go2 SRU PointGoal node. No
-SRU weights, architecture, controller, or existing project sources are changed.
+C++17 RGB-D BEV mapping, inspection coverage, frontier planning, person detection
+and asynchronous candidate-only VLM selection for the Go2 SRU PointGoal node.
+The simulator, SRU weights and low-level controller remain independent ROS2
+processes. The only motion output is `/goal_pose` (`PoseStamped`, `odom`);
+ThermalNav never publishes Twist.
 
 ```bash
-cd /media/user/data1/carl/workspace/thermalnav_demo
+cd ~/nav_ws/thermalnav_demo
 bash run_demo.sh build
 bash run_demo.sh test
+bash run_demo.sh integration-test  # isolated synthetic ROS graph; no simulator/SRU
+# On carl, start the existing Hospital/Go2 simulator, then:
 bash run_demo.sh doctor
-bash run_demo.sh heuristic  # foreground; run stop in another terminal
-bash run_demo.sh vlm
-bash run_demo.sh rviz
+bash run_demo.sh observe          # map only, no autonomous goals
+bash run_demo.sh rviz             # another terminal
+bash run_demo.sh start            # enable exploration in observe mode
 bash run_demo.sh stop
 ```
 
-Isaac must already be running. The runner starts SRU only when absent, using
-its original `--go2-sim` mode with the same parameters as the existing launch.
-It never runs Nav2 or publishes Twist. `/goal_pose` PoseStamped (`odom`) is the
-only motion interface; no Route/goal_active/relative_goal interfaces exist in
-this deployed SRU implementation. Its arrival radius is 0.75m; manager checks
-odometry plus fresh zero Twist. Cancellation uses a current-pose PointGoal.
+`heuristic` and `vlm` start exploration immediately. `observe` starts mapping
+without autonomous goals. The runner reuses an existing SRU node; otherwise it
+uses `SRU_PYTHON` (default `/home/carl/venvs/sru_ros/bin/python3`). `SRU_SETUP`
+can override the sibling deployment workspace setup. Local build/test does not
+require that sibling workspace. A previous Python demo must be stopped before
+starting the C++ runtime. Build artifacts use `/tmp/thermalnav_cpp_build_colcon`,
+logs `/tmp/thermalnav_colcon_log`, and the local ROS install is `install/`.
 
-Actual Go2 topics: `/robot0/front_cam/{rgb,depth,camera_info}`,
-`/robot0/{odom,imu,cmd_vel}`, `/tf`, `/tf_static`. RGB is rgb8, depth is 32FC1
-metres, 640x360, fx=fy≈733, cx=320, cy=180; optical frame
-`robot0/front_cam`. Camera clipping is 0.1–30m; this mapper accepts 0.15–8m.
-Go2 publishes sensor/TF simulation stamps but no `/clock`; node timers/watchdogs
-use wall time and TF queries use exact image stamps. Depth/odom skew >0.25s
-is rejected. Do not enable ROS use_sim_time without a clock source.
+Dependencies: ROS2 Humble (`rclcpp`, messages, `tf2_ros`, `cv_bridge`,
+`ament_cmake`, `ament_cmake_python`, `ament_cmake_gtest`), OpenCV development
+libraries, `nlohmann-json3-dev`, `libcurl4-openssl-dev`. Python is retained only
+for the Isaac SDK entry adapter, read-only diagnostics and live test tools.
+There is no Python navigation/mapping runtime or cross-repository import in
+the C++ executable.
 
-## Mapping and startup safety
+## Simulator contract
 
-The 0.10m grid grows from 30x30m. Occupancy, observed endpoints, inferred
-exploration, sensor-confirmed floor, coverage, trajectory and startup proof
-are separate. Occupancy remains unknown for inference-only cells. A floor
-endpoint requires a continuous valid depth neighbourhood and height ±0.06m
-relative to the hospital ground (z=0). Full-resolution obstacle endpoints in
-0.12–1.8m take precedence over floor, including table legs. Static obstacle
-history is conservative: it is not cleared by rays projected above the floor.
-This version is **single-floor** and is not a stair-navigation solution.
+Checked against `go2_omniverse` commit `be46713`, especially `core/omnigraph.py`,
+`core/ros2.py`, and `configs/robot_extrinsic.yaml`:
 
-[IntentNav Appendix A](https://arxiv.org/html/2606.08029v1#A1) supplies the
-3-degree bearing / 2m nearest reliable endpoint completion rule. Completion
-writes only `/thermalnav/inferred` and explored state, stops at known obstacles,
-and does not affect collision clearance or scan coverage. Camera blind-zone
-intersections are recomputed from live K and full stamped TF, including pitch;
-no paper-specific blind distance is hardcoded.
+* `/robot0/front_cam/{rgb,depth,camera_info}` share the camera optical frame
+  `robot0/front_cam`; resolution is 640x360, fx/fy approximately 733. Intrinsics
+  come from CameraInfo, not hardcoded mapper values. Pinhole depth is optical-Z
+  in metres (`32FC1`); the mapper also converts `16UC1` millimetres.
+* `odom -> robot0/base_link` is dynamic; `base_link -> front_cam` uses the same
+  optical-to-base extrinsic as `CameraCfg` with `convention="ros"`. Translation
+  is `[0.32487, -0.00095, 0.05362]` relative to the base. Do not add base height
+  or rotate the optical axes a second time in the mapper.
+* Images/TF/odometry use simulation stamps. Go2 does not publish `/clock`;
+  keep `use_sim_time=false`. TF uses the exact depth timestamp, odometry is
+  matched from a bounded history (maximum 0.25s skew), watchdogs use steady time.
+* Sensor subscriptions accept both reliable and best-effort publishers.
+  Maps/images/status use reliable, transient-local QoS for late RViz subscribers.
 
-The existing 0.35m circular footprint is retained. Every target and straight
-SRU segment requires collision-free swept footprints. Rejection diagnostics
-include `unknown_footprint`, `occupied`, `disconnected`, and `no_safe_path`.
-No safe candidate means zero new goals, not successful completion. The runner
-does not automatically issue a manual bootstrap move.
+## Mapping and exploration
 
-Optional **simulation-only** initialization certification:
+The 0.10m global grid grows from 30x30m. Occupancy (`/thermalnav/bev`), coverage
+(`/thermalnav/coverage`), near-field inference (`/thermalnav/inferred`), targets
+and robot trajectory are separate layers. ROS occupancy values are -1 unknown,
+0 free, 100 occupied. Static obstacle history is conservative. The mapper is
+single-floor (default ground z=0), not a stair-navigation solution.
 
-```bash
-# Stop the previous Isaac instance first; this command refuses duplicates.
-bash run_demo.sh observe       # separate terminal, before simulator
-bash run_demo.sh sim-certified # original simulation + bounded PhysX query
-bash run_demo.sh validate      # stationary baseline, automatic run, then stop
-```
+Every valid depth pixel contributes obstacle endpoints in the height band
+0.12–1.8m, including odd-pixel thin obstacles. Reliable ground endpoints within
+±0.06m contribute free cells. `floor_stride` (default 2) only samples floor and
+inference observations. Obstacle evidence takes precedence over floor evidence.
+Above-ground camera rays do not certify their 2D shadows as free: the former
+Python implementation incorrectly cleared the near-field blind zone this way.
+No dilation, hole filling or inferred cells are used to fabricate traversability.
 
-`sim_entry.py` wraps the original simulation entry without modifying it. It
-queries only the stationary initial 0.35m footprint: 9 floor support rays and
-an obstacle-height overlap box. A fresh successful attestation is accepted
-only at the matching pose. It never marks sensor-free cells, overrides an
-obstacle, moves with the robot, or certifies any forward region. Without this
-attestation, initialization stays uncertified. A safe initial footprint alone
-cannot establish a safe path across an unobserved gap; inference is deliberately
-insufficient. Status reports this limitation explicitly.
+Coverage tests floor-cell centres against the current camera FOV and the minimum
+valid depth in a five-pixel neighbourhood. Unknown, free and inspected are
+different states. Coverage values are -1 unknown, 0 mapped/unscanned, 50 observed
+floor, 75 suspected person, 100 occupied/unobservable. Near-field inference uses
+supported endpoints within 2m in 3° bearing bins, stops at known obstacles, and
+never promotes occupancy or coverage.
 
-## Detection, coverage and policies
+The 0.35m circular footprint and every outgoing/active SRU segment require
+verified clearance. A simulator startup certificate only covers its original
+bounded footprint and cannot bridge an unobserved gap. With the current
+horizontal front camera, exploration can legitimately remain blocked by that
+gap. C++ migration does not solve missing near-field sensor evidence, and zero
+safe candidates is not reported as successful exploration.
 
-OpenCV HOG supplies a dependency-free person detector (limited recall).
-Optionally set `THERMALNAV_DETECTOR_ONNX` to a local COCO YOLOv8/11 ONNX export
-with (84,N) output. Detection uses synchronized RGB/depth, median depth,
-stamped TF and multi-frame spatial deduplication. No GT target positions are
-used. A functioning detector is not evidence that a person was found.
+The node drops duplicate/out-of-order depth, clears TF and resubscribes static
+TF on simulation time rewind, and by default resets the map for the new episode.
+`reset_map_on_time_jump:=false` preserves map history only when an unchanged
+world/odom frame is guaranteed. Old detections and VLM replies cannot issue
+goals after a reset or stop. Stale depth/odom/command feedback holds navigation.
+Timers remain responsive while HOG/ONNX detection and VLM requests run in
+separate workers. Ctrl-C/SIGTERM requests a current-pose goal before shutdown.
 
-Coverage values: -1 unknown, 0 mapped/unscanned, 50 directly observed floor,
-75 suspected target, 100 occupied/unobservable. Ground-centre projection must
-be inside the camera image and in front of measured occluding depth. Robot
-motion, startup certification and near-field inference never mark coverage.
+RViz displays an opaque raw occupancy grid in `odom` plus a robot-centred RGB
+preview with explicit unknown/free/occupied colours. Coverage remains a separate
+optional display. `/thermalnav/status` includes checksums, mapping milliseconds,
+input stamps, TF failures, map/epoch counts, policy status and rejection reasons.
+Checksums use FNV-1a and include the grid bytes, not an algorithm performance score.
 
-VLM settings: `THERMALNAV_VLM_URL` (OpenAI-compatible base URL ending /v1),
-`THERMALNAV_VLM_MODEL`, optional `THERMALNAV_VLM_KEY`. Sends BEV/RGB, candidate
-IDs, history, coverage and detections asynchronously at decision events. Only
-an existing ID is accepted and revalidated. Missing service prints **VLM
-unavailable**, uses an explicit heuristic fallback, and keeps `vlm_calls=0`.
-`/thermalnav/status` contains counts, reasons, sensor geometry and policy mode.
+## Detection and VLM
 
-Runtime logs live only in `/tmp/thermalnav_demo_<uid>`. `manual-check` is a
-simulation-only comparison test and is **not** an automatic-start prerequisite.
+OpenCV HOG is the default person detector (limited recall). Set
+`THERMALNAV_DETECTOR_ONNX` to a local COCO YOLOv8/11 ONNX model with output
+`[1,84,N]` or `[1,N,84]`. Synchronized RGB-D, median box depth, stamped TF and
+multi-frame spatial deduplication produce target tracks. RGB remains a thermal
+proxy; this does not validate real infrared detection.
 
-## Latest startup validation
+VLM environment: `THERMALNAV_VLM_URL` (OpenAI-compatible base ending `/v1`),
+`THERMALNAV_VLM_MODEL`, optional `THERMALNAV_VLM_KEY`. Only an existing candidate
+ID is accepted, then revalidated on the current map. Missing/unavailable service
+reports an explicit heuristic fallback. `vlm_calls` counts actual HTTP attempts;
+an absent service configuration keeps it at zero. HTTP timeouts are bounded.
 
-18 unit tests and colcon build pass. On a fresh, stationary Hospital/Go2
-instance, PhysX returned nine supported ground probes and no footprint overlap;
-the bounded initial-pose certificate was accepted. The camera measured about
-0.435m height, 47.10° horizontal / 27.52° vertical FOV, and a 3.55m centre
-floor-blind distance including actual robot pitch. Completion accumulated
-1.72m² during settling and promoted **zero** inferred cells to verified free.
-One frontier component remained disconnected/unknown-footprint blocked;
-**zero automatic waypoints were completed**. The robot remained stopped.
-The earlier manually bootstrapped inspection run is not counted as an automatic
-startup success. More actual near-field sensor evidence (or a separately
-validated active-sensing capability) is needed to bridge this gap safely.
+Optional simulator tools remain available: `sim-certified`, `stop-certified-sim`,
+`validate`, `manual-check`, `status`. The certificate only attests the initial
+footprint, using nine floor probes and an overlap query. `manual-check` is an
+explicit motion test, never an exploration prerequisite.
+
+## Validation scope
+
+C++ tests cover world-coordinate accumulation/rotation, grid growth, unknown and
+occlusion handling, thin obstacles, floor evidence, coverage, fixed certificates,
+swept-footprint planning, localization, tracking and rendering. The isolated ROS
+test publishes best-effort Go2-shaped RGB-D/odom/TF, checks world-map history,
+duplicate frames, millimetre conversion, stale inputs, stop/reset and retained
+map delivery. These local checks do not replace Hospital/Isaac closed-loop
+validation on carl, nor demonstrate improved navigation success rate.

@@ -8,8 +8,8 @@ Visualization Manager:
     Frame Rate: 15
   Displays:
     - Class: rviz_default_plugins/Image
-      Name: IntentNav BEV RGB preview
-      Enabled: false
+      Name: BEV RGB preview
+      Enabled: true
       Topic:
         Value: /thermalnav/bev/rendered
         Reliability Policy: Reliable
@@ -20,12 +20,12 @@ Visualization Manager:
         Value: /thermalnav/bev/coverage_rendered
         Reliability Policy: Reliable
     - Class: rviz_default_plugins/Map
-      Name: Raw OccupancyGrid (toggle for diagnosis)
+      Name: Occupancy in odom
       Enabled: true
       Topic:
         Value: /thermalnav/bev
         Durability Policy: Transient Local
-      Alpha: 0.8
+      Alpha: 1.0
       Color Scheme: map
     - Class: rviz_default_plugins/Map
       Name: Raw Coverage OccupancyGrid (toggle for diagnosis)

@@ -1,0 +1,785 @@
+#include "thermalnav/core.hpp"
+#include "thermalnav/perception.hpp"
+#include <chrono>
+#include <csignal>
+#include <cv_bridge/cv_bridge.h>
+#include <deque>
+#include <future>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <iostream>
+#include <nav_msgs/msg/occupancy_grid.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <opencv2/imgproc.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <thread>
+#include <visualization_msgs/msg/marker_array.hpp>
+
+namespace thermalnav {
+using Image = sensor_msgs::msg::Image;
+using Odom = nav_msgs::msg::Odometry;
+using Pose = geometry_msgs::msg::PoseStamped;
+using Grid = nav_msgs::msg::OccupancyGrid;
+using Trigger = std_srvs::srv::Trigger;
+using Clock = std::chrono::steady_clock;
+double wall() {
+  return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+}
+double stamp(const std_msgs::msg::Header &h) {
+  return h.stamp.sec + h.stamp.nanosec * 1e-9;
+}
+Json pointJson(XY p) { return {p.x, p.y}; }
+
+class Demo : public rclcpp::Node {
+public:
+  Demo()
+      : Node("thermalnav_demo"), tf_(get_clock()),
+        listener_(std::make_unique<tf2_ros::TransformListener>(tf_)),
+        policy_(declare_parameter<std::string>("mode", "heuristic")) {
+    enabled_ = !declare_parameter<bool>("observe", false);
+    floor_ = declare_parameter<double>("floor_height", 0.);
+    stride_ = declare_parameter<int>("floor_stride", 2);
+    max_range_ = declare_parameter<double>("max_range", 8.);
+    reset_map_ = declare_parameter<bool>("reset_map_on_time_jump", true);
+    if (stride_ < 1 || !std::isfinite(floor_) || !std::isfinite(max_range_) ||
+        max_range_ <= .15 || max_range_ > 30)
+      throw std::invalid_argument("invalid mapper parameters");
+    auto retained = rclcpp::QoS(1).transient_local().reliable();
+    map_pub_ = create_publisher<Grid>("/thermalnav/bev", retained);
+    cover_pub_ = create_publisher<Grid>("/thermalnav/coverage", retained);
+    explored_pub_ = create_publisher<Grid>("/thermalnav/explored", retained);
+    inferred_pub_ = create_publisher<Grid>("/thermalnav/inferred", retained);
+    render_pub_ = create_publisher<Image>("/thermalnav/bev/rendered", retained);
+    cover_render_pub_ =
+        create_publisher<Image>("/thermalnav/bev/coverage_rendered", retained);
+    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/thermalnav/markers", retained);
+    path_pub_ = create_publisher<nav_msgs::msg::Path>("/thermalnav/trajectory",
+                                                      retained);
+    status_pub_ =
+        create_publisher<std_msgs::msg::String>("/thermalnav/status", retained);
+    goal_pub_ = create_publisher<Pose>("/goal_pose", 1);
+    auto sensor = rclcpp::SensorDataQoS().keep_last(5);
+    info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+        "/robot0/front_cam/camera_info", sensor,
+        [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
+          cv::Matx33d K;
+          std::copy(m->k.begin(), m->k.end(), K.val);
+          if (m->header.frame_id.empty() || !cv::checkRange(cv::Mat(K)) ||
+              K(0, 0) <= 0 || K(1, 1) <= 0 || !m->width || !m->height) {
+            blocked_ = "invalid CameraInfo";
+            return;
+          }
+          info_ = m;
+          K_ = K;
+        });
+    rgb_sub_ = create_subscription<Image>("/robot0/front_cam/rgb", sensor,
+                                          [this](Image::ConstSharedPtr m) {
+                                            rgbs_.push_back(m);
+                                            if (rgbs_.size() > 15)
+                                              rgbs_.pop_front();
+                                          });
+    depth_sub_ = create_subscription<Image>(
+        "/robot0/front_cam/depth", sensor, [this](Image::ConstSharedPtr m) {
+          double s = stamp(m->header);
+          if (last_received_stamp_ >= 0 && s < last_received_stamp_ - .5)
+            resetEpoch(s);
+          if (s <= last_stamp_ || (pending_ && s <= stamp(pending_->header)))
+            return;
+          last_received_stamp_ = s;
+          pending_ = m;
+        });
+    odom_sub_ = create_subscription<Odom>(
+        "/robot0/odom", sensor, [this](Odom::ConstSharedPtr m) { onOdom(m); });
+    cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+        "/robot0/cmd_vel", sensor,
+        [this](geometry_msgs::msg::Twist::ConstSharedPtr m) {
+          cmd_speed_ = std::abs(m->linear.x) + std::abs(m->linear.y) +
+                       std::abs(m->angular.z);
+          cmd_time_ = wall();
+        });
+    cert_sub_ = create_subscription<std_msgs::msg::String>(
+        "/thermalnav/startup_certificate", retained,
+        [this](std_msgs::msg::String::ConstSharedPtr m) {
+          try {
+            proof_ = Json::parse(m->data);
+          } catch (const Json::exception &) {
+            certificate_status_ = "rejected: malformed attestation";
+          }
+        });
+    start_srv_ = create_service<Trigger>(
+        "/thermalnav/start", [this](const std::shared_ptr<Trigger::Request>,
+                                    std::shared_ptr<Trigger::Response> res) {
+          enabled_ = true;
+          ++generation_;
+          res->success = true;
+          res->message = "Exploration enabled";
+        });
+    stop_srv_ = create_service<Trigger>(
+        "/thermalnav/stop", [this](const std::shared_ptr<Trigger::Request>,
+                                   std::shared_ptr<Trigger::Response> res) {
+          enabled_ = false;
+          cancel();
+          res->success = true;
+          res->message =
+              "Current-pose PointGoal sent; wait for SRU zero command";
+        });
+    process_timer_ = create_wall_timer(std::chrono::milliseconds(100),
+                                       [this] { process(); });
+    tick_timer_ =
+        create_wall_timer(std::chrono::seconds(1), [this] { tick(); });
+    trajectory_.header.frame_id = "odom";
+    RCLCPP_INFO(get_logger(), "C++ runtime; detector: %s; policy: %s",
+                detector_.name.c_str(), policy_.status.c_str());
+  }
+  ~Demo() override {
+    if (detection_.valid())
+      detection_.wait();
+    if (decision_.valid())
+      decision_.wait();
+  }
+  void close() {
+    enabled_ = false;
+    cancel();
+  }
+
+private:
+  XY robot() const {
+    return {odom_->pose.pose.position.x, odom_->pose.pose.position.y};
+  }
+  void resetEpoch(double s) {
+    listener_.reset();
+    tf_.clear();
+    listener_ = std::make_unique<tf2_ros::TransformListener>(tf_);
+    pending_.reset();
+    rgbs_.clear();
+    odoms_.clear();
+    tracks_.clear();
+    proof_ = Json();
+    if (reset_map_) {
+      bev_ = BEV();
+      trajectory_.poses.clear();
+      failed_.clear();
+      reached_.clear();
+      history_ = Json::array();
+    }
+    bev_.certificate.reset();
+    certificate_status_ = "unavailable";
+    active_.reset();
+    sent_.reset();
+    candidates_.clear();
+    ++generation_;
+    ++epoch_;
+    reset_stamp_ = s;
+    waiting_reset_odom_ = true;
+    odom_.reset();
+    last_stamp_ = -1.;
+    last_map_wall_ = 0;
+    blocked_ = "simulation time epoch reset; waiting for fresh odom";
+    RCLCPP_WARN(get_logger(), "Simulation time rewound; reset_map=%s",
+                reset_map_ ? "true" : "false");
+  }
+  void onOdom(Odom::ConstSharedPtr m) {
+    const auto &p = m->pose.pose.position;
+    const auto &q = m->pose.pose.orientation;
+    if (m->header.frame_id != "odom" || !std::isfinite(p.x) ||
+        !std::isfinite(p.y) || !std::isfinite(p.z)) {
+      blocked_ = "invalid odom/frame mismatch";
+      return;
+    }
+    try {
+      rotation(q.x, q.y, q.z, q.w);
+    } catch (const std::exception &) {
+      blocked_ = "invalid odom quaternion";
+      return;
+    }
+    if (waiting_reset_odom_ && std::abs(stamp(m->header) - reset_stamp_) > .25)
+      return;
+    if (odom_ && stamp(m->header) < stamp(odom_->header))
+      return;
+    odom_ = m;
+    last_odom_wall_ = wall();
+    odoms_.push_back(m);
+    if (odoms_.size() > 200)
+      odoms_.pop_front();
+    if (waiting_reset_odom_) {
+      waiting_reset_odom_ = false;
+      cancel();
+      blocked_.clear();
+    }
+    Pose pose;
+    pose.header = m->header;
+    pose.pose = m->pose.pose;
+    if (trajectory_.poses.empty() ||
+        cv::norm(robot() - XY(trajectory_.poses.back().pose.position.x,
+                              trajectory_.poses.back().pose.position.y)) >
+            .08) {
+      trajectory_.poses.push_back(pose);
+      auto c = bev_.cell(robot());
+      if (bev_.inside(c))
+        bev_.visits(c) = std::min(65535, int(bev_.visits(c)) + 1);
+    }
+  }
+  void process() {
+    if (detection_.valid() && detection_.wait_for(std::chrono::seconds(0)) ==
+                                  std::future_status::ready) {
+      try {
+        auto result = detection_.get();
+        if (detection_epoch_ == epoch_)
+          for (const auto &p : result)
+            addTrack(tracks_, p, detection_stamp_);
+      } catch (const std::exception &e) {
+        RCLCPP_WARN(get_logger(), "Detection unavailable: %s", e.what());
+      }
+    }
+    if (!pending_ || !info_ || !odom_ || odoms_.empty())
+      return;
+    auto m = pending_;
+    if (stamp(m->header) <= last_stamp_) {
+      pending_.reset();
+      return;
+    }
+    if (m->header.frame_id != info_->header.frame_id ||
+        m->width != info_->width || m->height != info_->height) {
+      blocked_ = "depth/info mismatch";
+      pending_.reset();
+      return;
+    }
+    auto nearest =
+        *std::min_element(odoms_.begin(), odoms_.end(), [&](auto a, auto b) {
+          return std::abs(stamp(a->header) - stamp(m->header)) <
+                 std::abs(stamp(b->header) - stamp(m->header));
+        });
+    double skew = std::abs(stamp(nearest->header) - stamp(m->header));
+    if (skew > .25) {
+      blocked_ = "depth/odom time mismatch";
+      return;
+    }
+    cv::Matx33d R;
+    cv::Vec3d t;
+    try {
+      auto tf = tf_.lookupTransform("odom", m->header.frame_id,
+                                    rclcpp::Time(m->header.stamp));
+      auto q = tf.transform.rotation;
+      auto tr = tf.transform.translation;
+      R = rotation(q.x, q.y, q.z, q.w);
+      t = {tr.x, tr.y, tr.z};
+    } catch (const tf2::TransformException &) {
+      ++tf_failures_;
+      blocked_ = "waiting for stamped camera TF";
+      return;
+    } catch (const std::exception &e) {
+      blocked_ = e.what();
+      return;
+    }
+    pending_.reset();
+    cv::Mat1f depth;
+    auto begin = Clock::now();
+    try {
+      if (m->encoding == "32FC1")
+        depth = cv_bridge::toCvCopy(m, "32FC1")->image;
+      else if (m->encoding == "16UC1")
+        cv_bridge::toCvShare(m, "16UC1")->image.convertTo(depth, CV_32F, .001);
+      else {
+        blocked_ = "unsupported depth encoding " + m->encoding;
+        return;
+      }
+      const auto &p = nearest->pose.pose.position;
+      bev_.integrate(depth, K_, R, t, {p.x, p.y}, floor_, stride_, max_range_);
+    } catch (const std::exception &e) {
+      blocked_ = "mapping/decode: " + std::string(e.what());
+      return;
+    }
+    usable_depth_ = bev_.diagnostics.value("valid_depth", 0) > 0;
+    map_ms_ =
+        std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+    if (!proof_.is_null() && !bev_.certificate) {
+      bool ok = bev_.acceptCertificate(proof_, robot(), stamp(m->header));
+      certificate_status_ =
+          ok ? "certified" : "rejected: " + bev_.certificate_rejection;
+      if (!ok)
+        proof_ = Json();
+    }
+    last_stamp_ = stamp(m->header);
+    last_map_wall_ = wall();
+    map_header_ = m->header;
+    map_header_.frame_id = "odom";
+    last_depth_ = {{"stamp", last_stamp_},
+                   {"encoding", m->encoding},
+                   {"shape", {m->height, m->width}},
+                   {"odom_stamp_skew_s", skew},
+                   {"camera_pose_odom_m", {t[0], t[1], t[2]}}};
+    if (blocked_.rfind("waiting", 0) == 0 ||
+        blocked_.rfind("depth/odom", 0) == 0 ||
+        blocked_.rfind("stale sensors", 0) == 0 ||
+        blocked_.rfind("depth/info", 0) == 0 ||
+        blocked_.rfind("mapping/decode", 0) == 0 ||
+        blocked_.rfind("unsupported depth", 0) == 0)
+      blocked_.clear();
+    if (!rgbs_.empty() && !detection_.valid() &&
+        wall() - last_detect_wall_ > 2) {
+      auto rgb =
+          *std::min_element(rgbs_.begin(), rgbs_.end(), [&](auto a, auto b) {
+            return std::abs(stamp(a->header) - last_stamp_) <
+                   std::abs(stamp(b->header) - last_stamp_);
+          });
+      double rgb_skew = std::abs(stamp(rgb->header) - last_stamp_);
+      last_depth_["rgb_depth_skew_s"] = rgb_skew;
+      if (rgb_skew < .08 && rgb->header.frame_id == m->header.frame_id &&
+          rgb->width == m->width && rgb->height == m->height) {
+        try {
+          rgb_ = cv_bridge::toCvCopy(rgb, "bgr8")->image;
+          last_rgb_wall_ = wall();
+          auto image = rgb_.clone();
+          auto dep = depth.clone();
+          auto K = K_;
+          last_detect_wall_ = wall();
+          detection_stamp_ = stamp(rgb->header);
+          detection_epoch_ = epoch_;
+          detection_ =
+              std::async(std::launch::async, [this, image, dep, K, R, t] {
+                std::vector<XY> points;
+                for (const auto &box : detector_.detect(image)) {
+                  auto p = localizeBox(box, dep, K, R, t);
+                  if (p)
+                    points.emplace_back((*p)[0], (*p)[1]);
+                }
+                return points;
+              });
+        } catch (const std::exception &e) {
+          blocked_ = "RGB decode: " + std::string(e.what());
+        }
+      }
+    }
+  }
+  void goal(XY xy) {
+    if (!odom_)
+      return;
+    Pose p;
+    p.header = odom_->header;
+    p.pose.position = odom_->pose.pose.position;
+    p.pose.position.x = xy.x;
+    p.pose.position.y = xy.y;
+    p.pose.orientation.w = 1.;
+    goal_pub_->publish(p);
+    sent_ = xy;
+    last_goal_wall_ = last_progress_wall_ = wall();
+    best_ = 1e9;
+  }
+  void cancel() {
+    if (odom_)
+      goal(robot());
+    active_.reset();
+    sent_.reset();
+    ++generation_;
+    cancel_until_ = wall() + 1.;
+  }
+  void chooseWaypoint(const Candidate &c) {
+    size_t near = 0;
+    for (size_t i = 1; i < c.path.size(); ++i)
+      if (cv::norm(c.path[i] - robot()) < cv::norm(c.path[near] - robot()))
+        near = i;
+    std::optional<XY> chosen;
+    for (size_t i = near + 1; i < c.path.size(); ++i) {
+      double d = cv::norm(c.path[i] - robot());
+      if (d > 1.6)
+        break;
+      if (!bev_.pathReason({robot(), c.path[i]}).empty())
+        break;
+      if (d > .85)
+        chosen = c.path[i];
+    }
+    if (!chosen) {
+      failed_.push_back(c.xy);
+      ++nav_failures_;
+      blocked_ = "no_safe_path: no straight SRU segment beyond arrival radius";
+      cancel();
+      return;
+    }
+    goal(*chosen);
+  }
+  void activate(Candidate c) {
+    blocked_.clear();
+    active_ = std::move(c);
+    ++selected_;
+    started_wall_ = wall();
+    state_ = active_->kind == "frontier"        ? "EXPLORE"
+             : active_->kind == "verify_target" ? "VERIFY_TARGET"
+                                                : "INSPECT";
+    auto selected = *active_;
+    chooseWaypoint(selected);
+    RCLCPP_INFO(get_logger(), "%s %s xy=(%.2f, %.2f)", state_.c_str(),
+                selected.id.c_str(), selected.xy.x, selected.xy.y);
+  }
+  std::vector<XY> excluded() const {
+    auto result = failed_;
+    result.insert(result.end(), reached_.begin(), reached_.end());
+    return result;
+  }
+  std::vector<XY> trajectoryXY() const {
+    std::vector<XY> out;
+    for (const auto &p : trajectory_.poses)
+      out.emplace_back(p.pose.position.x, p.pose.position.y);
+    return out;
+  }
+  double yaw() const {
+    const auto &q = odom_->pose.pose.orientation;
+    return std::atan2(2 * (q.w * q.z + q.x * q.y),
+                      1 - 2 * (q.y * q.y + q.z * q.z));
+  }
+  void tick() {
+    double now = wall();
+    std::optional<PolicyResult> reply;
+    if (decision_.valid() && decision_.wait_for(std::chrono::seconds(0)) ==
+                                 std::future_status::ready) {
+      try {
+        reply = decision_.get();
+        policy_.calls += reply->called;
+        policy_.status = reply->status;
+      } catch (const std::exception &) {
+        policy_.status = "VLM unavailable: worker failed; heuristic fallback";
+      }
+    }
+    if (!odom_) {
+      publishStatus();
+      return;
+    }
+    bool fresh = now - last_odom_wall_ <= 3 && now - last_map_wall_ <= 5 &&
+                 now - cmd_time_ <= 2 && last_stamp_ >= 0 && usable_depth_;
+    if (enabled_ && !fresh) {
+      if (active_)
+        cancel();
+      blocked_ = "stale sensors/command: navigation held";
+      publish();
+      return;
+    }
+    if (enabled_ && now >= cancel_until_) {
+      if (active_ && sent_) {
+        double d = cv::norm(*sent_ - robot());
+        if (d < best_ - .08) {
+          best_ = d;
+          last_progress_wall_ = now;
+        }
+        if (!bev_.pathReason({robot(), *sent_}).empty()) {
+          failed_.push_back(active_->xy);
+          ++nav_failures_;
+          blocked_ = "active segment invalidated by new map";
+          cancel();
+        } else if (d <= .75 && cmd_speed_ < .03 && now - last_goal_wall_ > 1) {
+          if (cv::norm(active_->xy - robot()) <= .8) {
+            ++completed_;
+            completed_kinds_[active_->kind] =
+                completed_kinds_[active_->kind].get<int>() + 1;
+            reached_.push_back(active_->xy);
+            history_.push_back({{"id", active_->id},
+                                {"kind", active_->kind},
+                                {"result", "reached"},
+                                {"xy", pointJson(active_->xy)}});
+            auto c = bev_.cell(active_->xy);
+            if (bev_.inside(c))
+              bev_.visits(c) = std::min(65535, int(bev_.visits(c)) + 5);
+            active_.reset();
+            sent_.reset();
+            cancel_until_ = now + 1.;
+          } else {
+            auto c = *active_;
+            chooseWaypoint(c);
+          }
+        } else if (now - last_progress_wall_ > 15 || now - started_wall_ > 90) {
+          failed_.push_back(active_->xy);
+          ++nav_failures_;
+          blocked_ = "navigation timeout";
+          cancel();
+        }
+      } else if (reply && decision_generation_ == generation_) {
+        auto cs = bev_.candidates(robot(), excluded(), tracks_);
+        auto match = std::find_if(cs.begin(), cs.end(), [&](const auto &c) {
+          return c.kind == reply->candidate.kind &&
+                 cv::norm(c.xy - reply->candidate.xy) < .3;
+        });
+        if (match != cs.end())
+          activate(*match);
+      } else if (!decision_.valid() && now - last_decision_ > 3 &&
+                 cmd_speed_ < .03) {
+        last_decision_ = now;
+        candidates_ = bev_.candidates(robot(), excluded(), tracks_);
+        if (!candidates_.empty()) {
+          if (policy_.remote()) {
+            Json context = {
+                {"candidates", Json::array()},
+                {"history", history_},
+                {"detections", trackJson(tracks_)},
+                {"coverage",
+                 {{"observed_cells", cv::countNonZero(bev_.scanned)},
+                  {"mapped_cells", cv::countNonZero(bev_.seen)}}}};
+            for (const auto &c : candidates_)
+              context["candidates"].push_back({{"candidate_id", c.id},
+                                               {"kind", c.kind},
+                                               {"xy", pointJson(c.xy)},
+                                               {"gain", c.gain},
+                                               {"cost", c.cost}});
+            auto bev_rgb =
+                renderer_.render(bev_, robot(), yaw(), trajectoryXY(),
+                                 candidates_, sent_, tracks_);
+            cv::Mat3b bgr;
+            cv::cvtColor(bev_rgb, bgr, cv::COLOR_RGB2BGR);
+            for (const auto &c : candidates_)
+              cv::putText(bgr, c.id, renderer_.pixel(c.xy, robot()),
+                          cv::FONT_HERSHEY_SIMPLEX, .3, {0, 0, 255}, 1);
+            auto image = now - last_rgb_wall_ < 3 ? rgb_.clone() : cv::Mat3b();
+            auto cs = candidates_;
+            auto policy = policy_;
+            decision_generation_ = generation_;
+            decision_ = std::async(
+                std::launch::async, [policy, cs, bgr, image, context] {
+                  return policy.choose(cs, bgr, image, context);
+                });
+          } else
+            activate(candidates_.front());
+        } else {
+          auto occ = bev_.occupancy();
+          int remaining = cv::countNonZero((occ == 0) & (bev_.scanned == 0));
+          bool unverified =
+              std::any_of(tracks_.begin(), tracks_.end(),
+                          [](const auto &t) { return !t.verified; });
+          if (remaining == 0 && bev_.frontier_components == 0 && !unverified &&
+              cv::countNonZero(occ == 0) > 0) {
+            state_ = "FINISH";
+            enabled_ = false;
+          } else
+            blocked_ =
+                "no safe reachable candidate; startup=" + bev_.startup_check +
+                "; unscanned=" + std::to_string(remaining);
+        }
+      }
+    }
+    publish();
+  }
+  Grid grid(const cv::Mat1b &data) const {
+    Grid m;
+    m.header = map_header_;
+    m.info.resolution = bev_.res;
+    m.info.width = data.cols;
+    m.info.height = data.rows;
+    m.info.origin.position.x = bev_.origin.x;
+    m.info.origin.position.y = bev_.origin.y;
+    m.info.origin.orientation.w = 1.;
+    m.data.reserve(data.total());
+    for (int y = 0; y < data.rows; ++y)
+      for (int x = 0; x < data.cols; ++x)
+        m.data.push_back(data(y, x) == 255 ? -1
+                                           : static_cast<int8_t>(data(y, x)));
+    return m;
+  }
+  void publish() {
+    if (last_stamp_ < 0) {
+      publishStatus();
+      return;
+    }
+    auto occ = bev_.occupancy();
+    map_pub_->publish(grid(occ));
+    cover_pub_->publish(grid(bev_.coverage(tracks_)));
+    cv::Mat1b explored(occ.size(), uint8_t(255)),
+        inferred(occ.size(), uint8_t(255));
+    explored.setTo(50, bev_.inferred);
+    explored.setTo(100, bev_.seen);
+    inferred.setTo(50, bev_.inferred);
+    explored_pub_->publish(grid(explored));
+    inferred_pub_->publish(grid(inferred));
+    trajectory_.header = odom_->header;
+    path_pub_->publish(trajectory_);
+    double hfov = bev_.blind_zone.value("hfov_deg", 47.);
+    auto image =
+        renderer_.render(bev_, robot(), yaw(), trajectoryXY(), candidates_,
+                         sent_, tracks_, hfov, max_range_);
+    render_pub_->publish(
+        *cv_bridge::CvImage(map_header_, "rgb8", image).toImageMsg());
+    cover_render_pub_->publish(
+        *cv_bridge::CvImage(map_header_, "rgb8",
+                            renderer_.coverage(bev_, robot(), tracks_))
+             .toImageMsg());
+    visualization_msgs::msg::MarkerArray markers;
+    visualization_msgs::msg::Marker clear;
+    clear.action = clear.DELETEALL;
+    markers.markers.push_back(clear);
+    auto marker = [&](XY xy, const std::string &ns, int id, cv::Vec3f color,
+                      const std::string &text = "") {
+      visualization_msgs::msg::Marker m;
+      m.header = odom_->header;
+      m.ns = ns;
+      m.id = id;
+      m.type = text.empty() ? m.SPHERE : m.TEXT_VIEW_FACING;
+      m.action = m.ADD;
+      m.pose.position.x = xy.x;
+      m.pose.position.y = xy.y;
+      m.pose.position.z = text.empty() ? .15 : .7;
+      m.pose.orientation.w = 1.;
+      m.scale.x = m.scale.y = m.scale.z = .25;
+      m.color.r = color[0];
+      m.color.g = color[1];
+      m.color.b = color[2];
+      m.color.a = 1.;
+      m.text = text;
+      markers.markers.push_back(m);
+    };
+    for (size_t i = 0; i < candidates_.size(); ++i)
+      marker(candidates_[i].xy, "candidates", int(i), {.2, .8, 1.});
+    if (sent_)
+      marker(*sent_, "selected", 0, {1., .7, 0.});
+    for (const auto &t : tracks_)
+      marker(t.xy, "targets", t.id, {1., 0., 0.},
+             t.verified ? "person verified" : "person suspect");
+    marker(robot(), "policy", 0, {1., 1., 1.}, state_ + " " + policy_.status);
+    marker_pub_->publish(markers);
+    publishStatus();
+  }
+  void publishStatus() {
+    auto occ = bev_.occupancy();
+    double area = bev_.res * bev_.res;
+    int total = cv::countNonZero(occ == 0),
+        scanned = cv::countNonZero((occ == 0) & (bev_.scanned != 0));
+    Json status = {
+        {"runtime", "cpp"},
+        {"state", state_},
+        {"enabled", enabled_},
+        {"policy", policy_.status},
+        {"vlm_calls", policy_.calls},
+        {"pose_source", "sim_gt_pose_via_odom"},
+        {"map_frame", "odom"},
+        {"robot_xy", odom_ ? pointJson(robot()) : Json(nullptr)},
+        {"trajectory_poses", trajectory_.poses.size()},
+        {"tf_failures", tf_failures_},
+        {"last_depth", last_depth_},
+        {"bev", bev_.diagnostics},
+        {"occupancy_grid_checksum", bev_.checksum(occ)},
+        {"coverage_grid_checksum", bev_.checksum(bev_.coverage(tracks_))},
+        {"map_frames", bev_.frames},
+        {"mapping_ms", map_ms_},
+        {"epoch", epoch_},
+        {"selected", selected_},
+        {"completed", completed_},
+        {"completed_by_kind", completed_kinds_},
+        {"certificate", certificate_status_},
+        {"startup_footprint", odom_ ? (bev_.footprintReason(robot()).empty()
+                                           ? "safe"
+                                           : bev_.footprintReason(robot()))
+                                    : "unavailable"},
+        {"frontier_components", bev_.frontier_components},
+        {"rejections", bev_.rejections},
+        {"nearfield", bev_.nearfield_stats},
+        {"inferred_m2", cv::countNonZero(bev_.inferred) * area},
+        {"blind_zone", bev_.blind_zone},
+        {"failed", nav_failures_},
+        {"free_m2", total * area},
+        {"occupied_m2", cv::countNonZero(occ == 100) * area},
+        {"observed_m2", cv::countNonZero(bev_.seen) * area},
+        {"scanned_m2", scanned * area},
+        {"coverage_fraction", double(scanned) / std::max(1, total)},
+        {"targets", trackJson(tracks_)},
+        {"candidates", candidates_.size()},
+        {"blocked", blocked_}};
+    std_msgs::msg::String m;
+    m.data = status.dump();
+    status_pub_->publish(m);
+  }
+  BEV bev_;
+  Renderer renderer_;
+  tf2_ros::Buffer tf_;
+  std::unique_ptr<tf2_ros::TransformListener> listener_;
+  Policy policy_;
+  Detector detector_;
+  sensor_msgs::msg::CameraInfo::ConstSharedPtr info_;
+  cv::Matx33d K_;
+  Odom::ConstSharedPtr odom_;
+  std::deque<Odom::ConstSharedPtr> odoms_;
+  Image::ConstSharedPtr pending_;
+  std::deque<Image::ConstSharedPtr> rgbs_;
+  cv::Mat3b rgb_;
+  std::vector<Track> tracks_;
+  std::vector<Candidate> candidates_;
+  std::optional<Candidate> active_;
+  std::optional<XY> sent_;
+  std::vector<XY> failed_, reached_;
+  nav_msgs::msg::Path trajectory_;
+  std_msgs::msg::Header map_header_;
+  Json proof_, last_depth_ = Json::object(), history_ = Json::array();
+  Json completed_kinds_ = {
+      {"frontier", 0}, {"inspection_viewpoint", 0}, {"verify_target", 0}};
+  std::future<std::vector<XY>> detection_;
+  std::future<PolicyResult> decision_;
+  uint64_t generation_{}, decision_generation_{}, epoch_{}, detection_epoch_{},
+      tf_failures_{};
+  int selected_{}, completed_{}, nav_failures_{}, stride_{};
+  double floor_{}, max_range_{}, last_stamp_{-1}, last_received_stamp_{-1},
+      reset_stamp_{}, last_map_wall_{}, last_odom_wall_{};
+  double last_rgb_wall_{}, last_detect_wall_{}, detection_stamp_{}, map_ms_{},
+      cmd_speed_{}, cmd_time_{}, cancel_until_{};
+  double last_decision_{}, last_goal_wall_{}, last_progress_wall_{},
+      started_wall_{}, best_{1e9};
+  bool enabled_{true}, reset_map_{true}, waiting_reset_odom_{false},
+      usable_depth_{false};
+  std::string state_{"EXPLORE"}, blocked_{"waiting for sensors"},
+      certificate_status_{"unavailable"};
+  rclcpp::Publisher<Grid>::SharedPtr map_pub_, cover_pub_, explored_pub_,
+      inferred_pub_;
+  rclcpp::Publisher<Image>::SharedPtr render_pub_, cover_render_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  rclcpp::Publisher<Pose>::SharedPtr goal_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      marker_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr info_sub_;
+  rclcpp::Subscription<Image>::SharedPtr rgb_sub_, depth_sub_;
+  rclcpp::Subscription<Odom>::SharedPtr odom_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr cert_sub_;
+  rclcpp::Service<Trigger>::SharedPtr start_srv_, stop_srv_;
+  rclcpp::TimerBase::SharedPtr process_timer_, tick_timer_;
+};
+} // namespace thermalnav
+
+namespace {
+volatile std::sig_atomic_t interrupted = 0;
+void stopSignal(int) { interrupted = 1; }
+} // namespace
+int main(int argc, char **argv) {
+  try {
+    rclcpp::init(argc, argv, rclcpp::InitOptions(),
+                 rclcpp::SignalHandlerOptions::None);
+    std::signal(SIGINT, stopSignal);
+    std::signal(SIGTERM, stopSignal);
+    auto node = std::make_shared<thermalnav::Demo>();
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    while (rclcpp::ok() && !interrupted) {
+      executor.spin_some();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (rclcpp::ok()) {
+      node->close();
+      auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+        executor.spin_some();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    executor.remove_node(node);
+    node.reset();
+    if (rclcpp::ok())
+      rclcpp::shutdown();
+    return 0;
+  } catch (const std::exception &e) {
+    std::cerr << "ThermalNav: " << e.what() << '\n';
+    if (rclcpp::ok())
+      rclcpp::shutdown();
+    return 1;
+  }
+}

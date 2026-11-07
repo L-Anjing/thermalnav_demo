@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile,DurabilityPolicy
+from rclpy.qos import QoSProfile,DurabilityPolicy,qos_profile_sensor_data
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import Image
@@ -14,8 +14,8 @@ from cv_bridge import CvBridge
 def main():
  rclpy.init();n=Node('thermalnav_validation');data={};subs=[];q=QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)
  for key,topic,kind in [('status','/thermalnav/status',String),('map','/thermalnav/bev',OccupancyGrid),('coverage','/thermalnav/coverage',OccupancyGrid)]:subs.append(n.create_subscription(kind,topic,lambda m,k=key:data.update({k:m}),q))
- subs.append(n.create_subscription(Odometry,'/robot0/odom',lambda m:data.update(odom=m),10))
- subs.append(n.create_subscription(Image,'/robot0/front_cam/rgb',lambda m:data.update(rgb=m),10))
+ subs.append(n.create_subscription(Odometry,'/robot0/odom',lambda m:data.update(odom=m),qos_profile_sensor_data))
+ subs.append(n.create_subscription(Image,'/robot0/front_cam/rgb',lambda m:data.update(rgb=m),qos_profile_sensor_data))
  start=n.create_client(Trigger,'/thermalnav/start');stop=n.create_client(Trigger,'/thermalnav/stop')
  if not start.wait_for_service(timeout_sec=10):raise RuntimeError('Demo missing')
  # Observe the initial stationary map before enabling autonomous goals.

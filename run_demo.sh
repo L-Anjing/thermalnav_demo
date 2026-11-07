@@ -3,7 +3,10 @@ set -eo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONNOUSERSITE=1 ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/thermalnav_ros}"
 source /opt/ros/humble/setup.bash
-source "$ROOT/../sru-robot-deployment/install/setup.bash"
+SRU_SETUP="${SRU_SETUP:-$ROOT/../sru-robot-deployment/install/setup.bash}"
+if [ -f "$SRU_SETUP" ]; then source "$SRU_SETUP"; fi
+if [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi
+DEMO_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav"
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 RUNTIME="/tmp/thermalnav_demo_${UID}"
 mkdir -p "$RUNTIME"
@@ -11,8 +14,8 @@ alive() {
     [ -f "$RUNTIME/$1.pid" ] || return 1
     local pid expected
     pid="$(cat "$RUNTIME/$1.pid")"
-    case "$1" in demo) expected='thermalnav.node';; sru) expected='rl_nav_controller.rl_nav_controller';; sim) expected='thermalnav.sim_entry';; *) return 1;; esac
-    kill -0 "$pid" 2>/dev/null && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "$expected"
+    case "$1" in demo) expected="thermalnav.node|/lib/thermalnav_demo/thermalnav";; sru) expected='rl_nav_controller.rl_nav_controller';; sim) expected='thermalnav.sim_entry';; *) return 1;; esac
+    kill -0 "$pid" 2>/dev/null && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Eq "$expected"
 }
 case "${1:-doctor}" in
   stop-certified-sim)
@@ -43,9 +46,10 @@ case "${1:-doctor}" in
   doctor) shift; exec /usr/bin/python3 -m thermalnav.doctor "$@" ;;
   build)
     cd "$ROOT"
-    colcon --log-base /tmp/thermalnav_colcon_log build --base-paths . --packages-select thermalnav_demo --build-base /tmp/thermalnav_build --install-base "$ROOT/install" --event-handlers console_direct+
+    colcon --log-base /tmp/thermalnav_colcon_log build --base-paths . --packages-select thermalnav_demo --build-base /tmp/thermalnav_cpp_build_colcon --install-base "$ROOT/install" --event-handlers console_direct+ --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE=/usr/bin/python3
     ;;
   heuristic|vlm|observe)
+    [ -x "$DEMO_BIN" ] || { echo "Build the C++ runtime first: bash run_demo.sh build" >&2; exit 2; }
     if alive demo; then echo 'ThermalNav already running'; exit 1; fi
     # Fail fast instead of leaving SRU/Demo waiting silently when Isaac is off.
     topics="$(ros2 topic list --no-daemon 2>/dev/null)"
@@ -56,7 +60,7 @@ case "${1:-doctor}" in
     # Never launch simulator here, and reuse an existing SRU controller.
     nodes="$(ros2 node list --no-daemon 2>/dev/null)"
     if ! grep -Eq 'navigation_policy_node|rl_nav_controller' <<< "$nodes"; then
-      /home/carl/venvs/sru_ros/bin/python3 -m rl_nav_controller.rl_nav_controller --go2-sim --ros-args -p use_sim_time:=false -p depth_topic:=/robot0/front_cam/depth -p odom_topic:=/robot0/odom -p cmd_vel_topic:=/robot0/cmd_vel -p require_joystick:=false -p publish_debug_depth:=false > "$RUNTIME/sru.log" 2>&1 &
+      "${SRU_PYTHON:-/home/carl/venvs/sru_ros/bin/python3}" -m rl_nav_controller.rl_nav_controller --go2-sim --ros-args -p use_sim_time:=false -p depth_topic:=/robot0/front_cam/depth -p odom_topic:=/robot0/odom -p cmd_vel_topic:=/robot0/cmd_vel -p require_joystick:=false -p publish_debug_depth:=false > "$RUNTIME/sru.log" 2>&1 &
       echo $! > "$RUNTIME/sru.pid"
       sleep 3
       if ! grep -q 'navigation model\|Learning model is ready\|ONNX provider' "$RUNTIME/sru.log"; then
@@ -65,8 +69,8 @@ case "${1:-doctor}" in
       fi
     fi
     mode="$1"; extra=()
-    if [ "$mode" = observe ]; then mode=heuristic; extra=(--observe); fi
-    /usr/bin/python3 -m thermalnav.node --mode "$mode" "${extra[@]}" > "$RUNTIME/demo.log" 2>&1 &
+    if [ "$mode" = observe ]; then mode=heuristic; extra=(-p observe:=true); fi
+    "$DEMO_BIN" --ros-args -p mode:="$mode" "${extra[@]}" > "$RUNTIME/demo.log" 2>&1 &
     echo $! > "$RUNTIME/demo.pid"
     echo "ThermalNav PID=$! mode=$mode. Log: $RUNTIME/demo.log"
     echo 'Waiting for stamped RGB-D/odom/TF; startup status follows.'
@@ -91,6 +95,11 @@ case "${1:-doctor}" in
     if alive sru; then kill -INT "$(cat "$RUNTIME/sru.pid")"; fi
     echo 'Stopped only ThermalNav-owned processes; simulator untouched.'
     ;;
-  test) cd "$ROOT"; exec /usr/bin/python3 -m unittest discover -s tests -v ;;
+  test)
+    cd "$ROOT"
+    colcon --log-base /tmp/thermalnav_colcon_log test --build-base /tmp/thermalnav_cpp_build_colcon --install-base "$ROOT/install" --packages-select thermalnav_demo --event-handlers console_direct+
+    colcon test-result --test-result-base /tmp/thermalnav_cpp_build_colcon --verbose
+    ;;
+  integration-test) exec /usr/bin/python3 "$ROOT/tests/test_ros_runtime.py" --binary "$DEMO_BIN" ;;
   *) echo 'Usage: bash run_demo.sh doctor|heuristic|vlm|rviz|stop|build|test|observe'; exit 2 ;;
 esac

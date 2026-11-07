@@ -14,20 +14,19 @@ def startup_audit():
     from nav_msgs.msg import OccupancyGrid
     from std_msgs.msg import String
     from rclpy.qos import QoSProfile,DurabilityPolicy
-    from .core import BEV
     rclpy.init();n=Node('thermalnav_startup_audit');data={};subs=[]
     qos=QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)
-    for name,topic,kind in [('map','/thermalnav/bev',OccupancyGrid),('proof','/thermalnav/startup_certificate',String)]:
+    for name,topic,kind in [('map','/thermalnav/bev',OccupancyGrid),('proof','/thermalnav/startup_certificate',String),('status','/thermalnav/status',String)]:
         subs.append(n.create_subscription(kind,topic,lambda m,k=name:data.update({k:m}),qos))
     end=time.monotonic()+8
-    while time.monotonic()<end and len(data)<2:rclpy.spin_once(n,timeout_sec=.1)
-    if len(data)==2:
-        m=data['map'];proof=json.loads(data['proof'].data);b=BEV();occ=np.array(m.data).reshape(m.info.height,m.info.width)
-        b.log=np.where(occ==0,-2.,2.);b.seen=occ!=-1;b.origin=np.array([m.info.origin.position.x,m.info.origin.position.y]);b.res=m.info.resolution
-        ok=b.accept_certificate(proof,np.array(proof['xy']),proof['stamp']+.01)
-        yy,xx=np.where(occ==100);points=np.column_stack((b.origin[0]+(xx+.5)*b.res,b.origin[1]+(yy+.5)*b.res))
+    while time.monotonic()<end and len(data)<3:rclpy.spin_once(n,timeout_sec=.1)
+    if len(data)==3:
+        m=data['map'];proof=json.loads(data['proof'].data);status=json.loads(data['status'].data)
+        occ=np.array(m.data).reshape(m.info.height,m.info.width)
+        yy,xx=np.where(occ==100)
+        points=np.column_stack((m.info.origin.position.x+(xx+.5)*m.info.resolution,m.info.origin.position.y+(yy+.5)*m.info.resolution))
         nearby=points[np.linalg.norm(points-np.array(proof['xy']),axis=1)<.6]
-        print('startup proof:',proof,'accepted_at_attested_pose=',ok,'reason=',getattr(b,'certificate_rejection',''),'nearby_occupied=',nearby.tolist())
+        print('startup proof:',proof,'C++ runtime certificate=',status.get('certificate'),'nearby_occupied=',nearby.tolist())
     else:print('FAIL missing startup audit topics:',list(data))
     n.destroy_node();rclpy.shutdown()
 
@@ -36,7 +35,7 @@ def main():
     rclpy.init();n=Node('thermalnav_doctor');buf=Buffer();listener=TransformListener(buf,n);got={};counts={};subs=[]
     topics={'/robot0/front_cam/rgb':Image,'/robot0/front_cam/depth':Image,'/robot0/front_cam/camera_info':CameraInfo,'/robot0/odom':Odometry,'/robot0/imu':Imu}
     def cb(m,t):got[t]=m;counts[t]=counts.get(t,0)+1
-    for t,k in topics.items():subs.append(n.create_subscription(k,t,lambda m,t=t:cb(m,t),10))
+    for t,k in topics.items():subs.append(n.create_subscription(k,t,lambda m,t=t:cb(m,t),qos_profile_sensor_data))
     end=time.monotonic()+10
     while time.monotonic()<end:rclpy.spin_once(n,timeout_sec=.1)
     ok=True
