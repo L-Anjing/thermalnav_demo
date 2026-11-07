@@ -1,0 +1,15 @@
+install/
+build/
+log/
+logs/
+__pycache__/
+*.egg-info/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+dist/
+.env
+.env.*
+!.env.example
+*.log

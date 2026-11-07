@@ -1,0 +1,59 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Fixed Frame: odom
+    Frame Rate: 15
+  Displays:
+    - Class: rviz_default_plugins/Image
+      Name: IntentNav BEV RGB preview
+      Enabled: false
+      Topic:
+        Value: /thermalnav/bev/rendered
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Image
+      Name: Inspection Coverage
+      Enabled: false
+      Topic:
+        Value: /thermalnav/bev/coverage_rendered
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Map
+      Name: Raw OccupancyGrid (toggle for diagnosis)
+      Enabled: true
+      Topic:
+        Value: /thermalnav/bev
+        Durability Policy: Transient Local
+      Alpha: 0.8
+      Color Scheme: map
+    - Class: rviz_default_plugins/Map
+      Name: Raw Coverage OccupancyGrid (toggle for diagnosis)
+      Enabled: false
+      Topic:
+        Value: /thermalnav/coverage
+        Durability Policy: Transient Local
+      Alpha: 0.4
+      Color Scheme: costmap
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Candidates selected targets policy
+      Enabled: true
+      Marker Topic:
+        Value: /thermalnav/markers
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Path
+      Name: Robot trajectory
+      Enabled: true
+      Topic:
+        Value: /thermalnav/trajectory
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Image
+      Name: RGB Thermal proxy
+      Enabled: true
+      Topic:
+        Value: /robot0/front_cam/rgb
+        Reliability Policy: Best Effort
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Scale: 18
