@@ -13,3 +13,21 @@ dist/
 .env.*
 !.env.example
 *.log
+
+# Keep only source, configuration, tests, and documentation in this repository.
+/checkpoints/
+/weights/
+/models/
+/results/
+/recordings/
+/bags/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.bag
+*.db3
+*.mcap
+*.so
+*.o
+*.a

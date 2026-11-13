@@ -10,11 +10,20 @@ namespace thermalnav {
 using Json = nlohmann::json;
 using XY = cv::Point2d;
 struct Candidate {
+  Candidate()=default;
+  Candidate(std::string id_,std::string kind_,XY xy_,std::vector<XY> path_,
+            double gain_=0.,double cost_=0.,double score_=0.,int target_id_=-1)
+      :id(std::move(id_)),kind(std::move(kind_)),xy(xy_),path(std::move(path_)),
+       gain(gain_),cost(cost_),score(score_),target_id(target_id_){}
   std::string id, kind;
   XY xy;
   std::vector<XY> path;
   double gain{}, cost{}, score{};
   int target_id{-1};
+  std::optional<XY> look_at;
+  std::optional<XY> approach;
+  double expected_scan_m2{};
+  std::optional<double> view_yaw; // Inspection intent; SRU PointGoal has no yaw contract.
 };
 struct Track {
   int id{}, hits{1};
@@ -26,6 +35,7 @@ Json trackJson(const std::vector<Track> &tracks);
 void addTrack(std::vector<Track> &tracks, XY xy, double stamp);
 cv::Matx33d rotation(double x, double y, double z, double w);
 std::vector<cv::Point> ray(cv::Point a, cv::Point b);
+Json frontierClusterSnapshot(const cv::Mat &stats,const cv::Mat &centres,XY origin,double resolution);
 std::optional<cv::Vec3d> localizeBox(const cv::Rect2d &box,
                                      const cv::Mat1f &depth,
                                      const cv::Matx33d &K, const cv::Matx33d &R,
@@ -52,16 +62,18 @@ public:
   Json blindZone(const cv::Matx33d &K, const cv::Matx33d &R, const cv::Vec3d &t,
                  int width, int height, XY robot, double floor) const;
   bool acceptCertificate(const Json &proof, XY robot, double stamp);
+  Json recordVerifiedTraversal(const Json &proof, XY actual_pose, double pose_stamp);
   std::string footprintReason(XY xy) const;
   std::string pathReason(const std::vector<XY> &path) const;
   std::vector<Candidate> candidates(XY robot, const std::vector<XY> &failed,
-                                    const std::vector<Track> &targets);
+                                    const std::vector<Track> &targets,
+                                    bool nearest_baseline = false);
   uint64_t checksum(const cv::Mat1b &grid) const;
 
   double res, footprint;
   XY origin;
   cv::Mat1f log;
-  cv::Mat1b seen, scanned, inferred, floor_evidence;
+  cv::Mat1b seen, scanned, inferred, floor_evidence, traversed;
   cv::Mat_<uint16_t> visits;
   uint64_t frames{};
   std::optional<Json> certificate;
@@ -70,6 +82,7 @@ public:
        blind_zone = Json::object();
   Json rejections = Json::object();
   int frontier_components{};
+  Json frontier_observations=Json::array(); // Audit of the actual extraction, not a second extractor.
 };
 
 class Renderer {

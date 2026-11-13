@@ -13,7 +13,16 @@ LOG_BASE="${THERMALNAV_LOG_BASE:-/tmp/thermalnav_colcon_log_${UID}}"
 TEST_BIN="$BUILD_BASE/thermalnav_demo/test_ros_runtime"
 STEREO_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_stereo"
 EVALUATE_BIN="$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_evaluate"
-MAPPING_SOURCE="${MAPPING_SOURCE:-fused}"
+if [ "${1:-}" = hospital-baseline ]; then
+  MAPPING_SOURCE="${MAPPING_SOURCE:-depth_only}"
+else
+  MAPPING_SOURCE="${MAPPING_SOURCE:-fused}"
+fi
+SRU_POLICY_VARIANT="${SRU_POLICY_VARIANT:-baseline}"
+case "$SRU_POLICY_VARIANT" in
+  safety|baseline|original) ;;
+  *) echo 'SRU_POLICY_VARIANT must be safety, baseline or original' >&2; exit 2 ;;
+esac
 CAMERA_RIG="${CAMERA_RIG:-legacy}"
 case "$CAMERA_RIG" in
   legacy)
@@ -36,9 +45,11 @@ RUNTIME="/tmp/thermalnav_demo_${UID}"
 mkdir -p "$RUNTIME"
 alive() {
     [ -f "$RUNTIME/$1.pid" ] || return 1
-    local pid expected
+    local pid expected executable
     pid="$(cat "$RUNTIME/$1.pid")"
-    case "$1" in demo) expected="/lib/thermalnav_demo/thermalnav([[:space:]]|$)";; stereo) expected='/lib/thermalnav_demo/thermalnav_stereo([[:space:]]|$)';; sru) expected='rl_nav_controller.rl_nav_controller';; *) return 1;; esac
+    case "$1" in demo) expected="/lib/thermalnav_demo/thermalnav([[:space:]]|$)";; stereo) expected='/lib/thermalnav_demo/thermalnav_stereo([[:space:]]|$)';; sru) expected='rl_nav_controller.rl_nav_controller';; thermal|detector|baseline|decision_viz)
+      case "$1" in thermal) executable=thermalnav_thermal;; detector) executable=thermalnav_thermal_detector;; baseline) executable=thermalnav_baseline;; decision_viz) executable=thermalnav_decision_visualizer;; esac
+      expected="/lib/thermalnav_demo/$executable([[:space:]]|$)";; *) return 1;; esac
     kill -0 "$pid" 2>/dev/null && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Eq "$expected"
 }
 case "${1:-doctor}" in
@@ -92,7 +103,7 @@ case "${1:-doctor}" in
           -Dnlohmann_json_DIR=/usr/lib/cmake/nlohmann_json
       ' thermalnav-build "$LOG_BASE" "$BUILD_BASE" "$ROOT/install"
     ;;
-  heuristic|vlm|observe)
+  heuristic|vlm|observe|hospital-baseline)
     [ -x "$DEMO_BIN" ] || { echo "Build the C++ runtime first: bash run_demo.sh build" >&2; exit 2; }
     if alive demo; then echo 'ThermalNav already running'; exit 1; fi
     # Fail fast instead of leaving SRU/Demo waiting silently when Isaac is off.
@@ -103,9 +114,20 @@ case "${1:-doctor}" in
     fi
     if [ "$MAPPING_SOURCE" != depth_only ]; then
       [ -x "$STEREO_BIN" ] || { echo 'Build the stereo frontend first' >&2; exit 2; }
-      if ! grep -qx "$RIGHT_TOPIC" <<< "$topics"; then
-        if [ "$MAPPING_SOURCE" = stereo_only ]; then echo '[ERROR] Right RGB camera missing; start simulator with STEREO_RGB=1' >&2; exit 2; fi
-        echo '[WARN] Right RGB camera missing; fused mode will report depth-only fallback.' >&2
+      for input in "$LEFT_TOPIC" "$RIGHT_TOPIC" "$LEFT_INFO" "$RIGHT_INFO"; do
+        if ! ros2 topic info --no-daemon "$input" 2>/dev/null | grep -Eq '^Publisher count: [1-9]'; then
+          echo "[ERROR] Missing stereo publisher: $input. Match CAMERA_RIG to Isaac and enable STEREO_RGB=1." >&2
+          exit 2
+        fi
+      done
+      if ros2 node list --no-daemon 2>/dev/null | grep -qx '/thermalnav_stereo'; then
+        for spec in "left_topic:$LEFT_TOPIC" "right_topic:$RIGHT_TOPIC" "left_info_topic:$LEFT_INFO" "right_info_topic:$RIGHT_INFO"; do
+          actual="$(timeout 5 ros2 param get /thermalnav_stereo "${spec%%:*}" 2>/dev/null || true)"
+          if [ "$actual" != "String value is: ${spec#*:}" ]; then
+            echo "[ERROR] Existing stereo configuration mismatch: ${spec%%:*}: $actual; expected ${spec#*:}" >&2
+            exit 2
+          fi
+        done
       fi
       if ! alive stereo && ! ros2 node list --no-daemon 2>/dev/null | grep -qx '/thermalnav_stereo'; then
         "$STEREO_BIN" "${STEREO_ARGS[@]}" > "$RUNTIME/stereo.log" 2>&1 &
@@ -113,10 +135,29 @@ case "${1:-doctor}" in
       fi
     fi
     if ! grep -qx "$DEPTH_TOPIC" <<< "$topics"; then echo "[ERROR] Mapping depth missing: $DEPTH_TOPIC (check CAMERA_RIG on both terminals)" >&2; exit 2; fi
+    if [ "$1" = hospital-baseline ]; then
+      for topic in /robot0/front_cam/rgb /robot0/front_cam/depth /robot0/front_cam/camera_info /robot0/front_cam/semantic_segmentation /robot0/front_cam/semantic_segmentation_labels; do
+        if ! ros2 topic info --no-daemon "$topic" 2>/dev/null | grep -Eq '^Publisher count: [1-9]'; then
+          echo "[ERROR] Baseline requires an aligned semantic RGB-D camera: missing $topic" >&2; exit 2
+        fi
+      done
+      for node in thermalnav_thermal thermalnav_thermal_detector thermalnav_baseline thermalnav_decision_visualizer; do
+        [ -x "$ROOT/install/thermalnav_demo/lib/thermalnav_demo/$node" ] || { echo "Build missing module: $node" >&2; exit 2; }
+        if ros2 node list --no-daemon 2>/dev/null | grep -qx "/$node"; then echo "[ERROR] $node already running; stop its owner before restarting baseline" >&2; exit 2; fi
+      done
+    fi
     # Never launch simulator here, and reuse an existing SRU controller.
     nodes="$(ros2 node list --no-daemon 2>/dev/null)"
+    if grep -qx '/navigation_policy_node' <<< "$nodes"; then
+      active_variant="$(timeout 5 ros2 param get /navigation_policy_node policy_variant 2>/dev/null || true)"
+      if [ "$active_variant" != "String value is: $SRU_POLICY_VARIANT" ]; then
+        echo "[ERROR] Existing SRU model differs from requested $SRU_POLICY_VARIANT: $active_variant" >&2
+        echo 'Restart the existing SRU with the requested policy_variant before retrying.' >&2
+        exit 3
+      fi
+    fi
     if ! grep -Eq 'navigation_policy_node|rl_nav_controller' <<< "$nodes"; then
-      "${SRU_PYTHON:-/home/carl/venvs/sru_ros/bin/python3}" -m rl_nav_controller.rl_nav_controller --go2-sim --ros-args -p use_sim_time:=false -p depth_topic:=/robot0/front_cam/depth -p odom_topic:=/robot0/odom -p cmd_vel_topic:=/robot0/cmd_vel -p require_joystick:=false -p publish_debug_depth:=false > "$RUNTIME/sru.log" 2>&1 &
+      "${SRU_PYTHON:-/home/carl/venvs/sru_ros/bin/python3}" -m rl_nav_controller.rl_nav_controller --go2-sim --ros-args --params-file "$ROOT/config/sru_pointgoal.yaml" -p policy_variant:="$SRU_POLICY_VARIANT" -p use_sim_time:=false -p depth_topic:=/robot0/front_cam/depth -p odom_topic:=/robot0/odom -p cmd_vel_topic:=/robot0/cmd_vel -p require_joystick:=false -p publish_debug_depth:=false > "$RUNTIME/sru.log" 2>&1 &
       echo $! > "$RUNTIME/sru.pid"
       sleep 3
       if ! grep -q 'navigation model\|Learning model is ready\|ONNX provider' "$RUNTIME/sru.log"; then
@@ -126,6 +167,21 @@ case "${1:-doctor}" in
     fi
     mode="$1"; extra=()
     if [ "$mode" = observe ]; then mode=heuristic; extra=(-p observe:=true); fi
+    if [ "$mode" = hospital-baseline ]; then
+      # Clear any retained PointGoal before this manager takes ownership.
+      # In particular a simulator epoch change must not rearm an old goal.
+      timeout 17 "$TOOLS_BIN" --ros-args -p task:=stop-goal || exit 4
+      profile="${HOSPITAL_BASELINE_CONFIG:-$ROOT/config/hospital_baseline.yaml}"
+      [ -f "$profile" ] || { echo "Missing baseline config: $profile" >&2; exit 2; }
+      "$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_thermal" --ros-args --params-file "$profile" > "$RUNTIME/thermal.log" 2>&1 &
+      echo $! > "$RUNTIME/thermal.pid"
+      "$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_thermal_detector" --ros-args --params-file "$profile" > "$RUNTIME/detector.log" 2>&1 &
+      echo $! > "$RUNTIME/detector.pid"
+      mode=heuristic; extra=(-p observe:=true -p external_perception:=true -p external_manager:=true)
+      if [ "${BASELINE_SAFETY_MODE:-depth_only}" = sim_only_safety_oracle ]; then
+        extra+=(-p verified_traversal_mode:=sim_only_safety_oracle)
+      fi
+    fi
     "$DEMO_BIN" --ros-args -p mode:="$mode" -p mapping_source:="$MAPPING_SOURCE" -p mapping_depth_topic:="$DEPTH_TOPIC" -p mapping_info_topic:="$INFO_TOPIC" -p stereo_info_topic:="$LEFT_INFO" -p mapping_depth_dropout:="${MAPPING_DEPTH_DROPOUT:-0.0}" -p mapping_depth_noise_sigma:="${MAPPING_DEPTH_NOISE_SIGMA:-0.0}" -p mapping_depth_hole_fraction:="${MAPPING_DEPTH_HOLE_FRACTION:-0.0}" -p mapping_depth_max_range:="${MAPPING_DEPTH_MAX_RANGE:-8.0}" -p collision_height:="${COLLISION_HEIGHT:-0.65}" "${extra[@]}" > "$RUNTIME/demo.log" 2>&1 &
     echo $! > "$RUNTIME/demo.pid"
     echo "ThermalNav PID=$! mode=$mode. Log: $RUNTIME/demo.log"
@@ -139,17 +195,50 @@ case "${1:-doctor}" in
       echo '[ERROR] ThermalNav node did not join ROS graph.' >&2; tail -30 "$RUNTIME/demo.log" >&2; exit 5
     fi
     echo 'Node ready. Inspect live state with: bash run_demo.sh status'
+    if [ "$1" = hospital-baseline ]; then
+      baseline_args=()
+      if [ -n "${BASELINE_INITIAL_STAGE:-}" ]; then baseline_args+=(-p initial_stage:="$BASELINE_INITIAL_STAGE"); fi
+      if [ -n "${BASELINE_METRICS_FILE:-}" ]; then baseline_args+=(-p metrics_file:="$BASELINE_METRICS_FILE"); fi
+      "$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_baseline" --ros-args --params-file "$profile" -p safety_mode:="${BASELINE_SAFETY_MODE:-depth_only}" "${baseline_args[@]}" > "$RUNTIME/baseline.log" 2>&1 &
+      echo $! > "$RUNTIME/baseline.pid"
+      "$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_decision_visualizer" --ros-args --params-file "$profile" > "$RUNTIME/decision_viz.log" 2>&1 &
+      echo $! > "$RUNTIME/decision_viz.pid"
+      echo 'Baseline manager: /thermalnav/baseline/status. Metrics: /tmp/thermalnav_baseline/metrics.csv'
+    fi
     wait "$(cat "$RUNTIME/demo.pid")"
     ;;
-  rviz) exec rviz2 -d "$ROOT/config/demo.rviz" --ros-args -r "/thermalnav/rgb_proxy:=$LEFT_TOPIC" ;;
+  rviz)
+    if ros2 node list --no-daemon 2>/dev/null | grep -qx '/thermalnav_baseline'; then
+      exec rviz2 -d "$ROOT/config/hospital_baseline.rviz"
+    fi
+    exec rviz2 -d "$ROOT/config/demo.rviz" --ros-args -r "/thermalnav/rgb_proxy:=$LEFT_TOPIC" ;;
+  baseline-evaluate)
+    exec "$ROOT/install/thermalnav_demo/lib/thermalnav_demo/thermalnav_baseline_evaluate" \
+      "${HOSPITAL_PEOPLE_GT:-/tmp/thermalnav_hospital_people_gt.json}" \
+      /tmp/thermalnav_baseline/detections.json /tmp/thermalnav_baseline/metrics.csv "${EVALUATION_SECONDS:-6}"
+    ;;
   stop)
+    requested_stop=false
+    if alive baseline; then
+      requested_stop=true
+      timeout 5 ros2 service call /thermalnav/baseline/stop std_srvs/srv/Trigger '{}' >/dev/null || true
+      kill -INT "$(cat "$RUNTIME/baseline.pid")"
+    fi
     if alive demo; then
+      requested_stop=true
       timeout 5 ros2 service call /thermalnav/stop std_srvs/srv/Trigger '{}' >/dev/null || true
       kill -INT "$(cat "$RUNTIME/demo.pid")"
     fi
     sleep 2
     if alive stereo; then kill -INT "$(cat "$RUNTIME/stereo.pid")"; fi
+    if { [ "$requested_stop" = true ] || alive sru; } && [ -x "$TOOLS_BIN" ]; then
+      if ! timeout 17 "$TOOLS_BIN" --ros-args -p task:=stop-goal; then
+        echo '[ERROR] SRU stop not confirmed; leaving SRU running to process cancellation.' >&2
+        exit 4
+      fi
+    fi
     if alive sru; then kill -INT "$(cat "$RUNTIME/sru.pid")"; fi
+    for module in decision_viz detector thermal; do if alive "$module"; then kill -INT "$(cat "$RUNTIME/$module.pid")"; fi; done
     echo 'Stopped only ThermalNav-owned processes; simulator untouched.'
     ;;
   test)
@@ -161,5 +250,5 @@ case "${1:-doctor}" in
     [ -x "$TEST_BIN" ] && [ -x "$DEMO_BIN" ] || { echo "Build with BUILD_TESTING=ON first" >&2; exit 2; }
     exec "$TEST_BIN" --binary "$DEMO_BIN" --tools-binary "$TOOLS_BIN" --stereo-binary "$STEREO_BIN" --evaluation-binary "$EVALUATE_BIN"
     ;;
-  *) echo 'Usage: bash run_demo.sh build|test|integration-test|doctor|observe|heuristic|vlm|rviz|status|stereo-status|start|stop|manual-check|validate|stereo|evaluate'; exit 2 ;;
+  *) echo 'Usage: bash run_demo.sh build|test|integration-test|doctor|hospital-baseline|baseline-evaluate|observe|heuristic|vlm|rviz|status|stereo-status|start|stop|manual-check|validate|stereo|evaluate'; exit 2 ;;
 esac

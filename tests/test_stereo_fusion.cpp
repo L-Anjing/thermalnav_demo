@@ -291,3 +291,41 @@ TEST(Fusion, StereoRecoversKnownCellsInsidePersistentDepthHole) {
             << " fused=" << after << " stereo_points=" << result.points.size()
             << std::endl;
 }
+
+TEST(Fusion, KnownWallStopsClearingBehindIt) {
+  BEV b;OccupancyFusion f;auto o=observation("depth");o.origin={0,0,.4};
+  o.points={{{0,0,1},1,0,false}};f.integrate({o},b);
+  o.stamp=2;o.points={{{0,0,2},1,0,false}};
+  auto status=f.integrate({o},b);
+  EXPECT_GT(status["occlusion_stopped_rays"].get<int>(),0);
+  EXPECT_EQ(f.tree().search(1.5,0,.4),nullptr);
+  EXPECT_EQ(b.occupancy()(b.cell({1.05,.05})),100);
+}
+TEST(Fusion, HistoricalEvidenceAndThermalMaskStayIndependent) {
+  BEV b;OccupancyFusion f;auto o=observation("depth");verticalGround(o);
+  f.integrate({o},b);auto before=b.occupancy();
+  o.stamp=2;o.points.clear();f.integrate({o},b);
+  EXPECT_EQ(cv::countNonZero(before!=b.occupancy()),0);
+  EXPECT_EQ(cv::countNonZero(b.scanned),0);
+  auto inferred=b.complete({{1,0,0},{1,.01,0},{1,.02,0},{1,.03,0}},{0,0});
+  EXPECT_GT(inferred["valid_bins"].get<int>(),0);
+  auto inf=b.inferred.clone();o.stamp=3;f.integrate({o},b);
+  EXPECT_EQ(cv::countNonZero(inf!=b.inferred),0);
+  EXPECT_EQ(cv::countNonZero(before!=b.occupancy()),0);
+}
+TEST(Fusion, GroundDoesNotCertifyUnobservedUpperClearance) {
+  BEV b;OccupancyFusion f;auto o=observation("depth");o.origin={0,0,.4};
+  o.points={{{0,.4,2},1,0,true}};f.integrate({o},b);
+  auto c=b.cell({2.05,.05});
+  EXPECT_TRUE(b.floor_evidence(c));
+  EXPECT_EQ(b.occupancy()(c),255);
+}
+TEST(Fusion, TranslationAndRotationAccumulateSeparateWorldGround) {
+  BEV b;OccupancyFusion f;auto o=observation("depth");verticalGround(o);f.integrate({o},b);
+  auto old=b.occupancy();int free0=cv::countNonZero(old==0);
+  o.stamp=2;o.origin[0]=2;f.integrate({o},b);
+  EXPECT_GE(cv::countNonZero(b.occupancy()==0),2*free0);
+  EXPECT_EQ(cv::countNonZero((old==0)&(b.occupancy()!=0)),0);
+  o.stamp=3;cv::Matx33d yaw(0,-1,0,1,0,0,0,0,1);o.R=yaw*o.R;o.origin={0,2,1};
+  f.integrate({o},b);EXPECT_GE(cv::countNonZero(b.occupancy()==0),3*free0);
+}

@@ -47,6 +47,12 @@ public:
         listener_(std::make_unique<tf2_ros::TransformListener>(tf_)),
         policy_(declare_parameter<std::string>("mode", "heuristic")) {
     enabled_ = !declare_parameter<bool>("observe", false);
+    external_perception_ = declare_parameter<bool>("external_perception", false);
+    external_manager_ = declare_parameter<bool>("external_manager", false);
+    if(external_manager_){enabled_=false;state_="MAPPING_ONLY";}
+    traversal_mode_=declare_parameter<std::string>("verified_traversal_mode","disabled");
+    if(traversal_mode_!="disabled" && traversal_mode_!="sim_only_safety_oracle")
+      throw std::invalid_argument("invalid verified_traversal_mode");
     floor_ = declare_parameter<double>("floor_height", 0.);
     stride_ = declare_parameter<int>("floor_stride", 2);
     max_range_ = declare_parameter<double>("max_range", 8.);
@@ -84,8 +90,11 @@ public:
     auto retained = rclcpp::QoS(1).transient_local().reliable();
     map_pub_ = create_publisher<Grid>("/thermalnav/bev", retained);
     cover_pub_ = create_publisher<Grid>("/thermalnav/coverage", retained);
+    scan_mask_pub_ = create_publisher<Grid>("/thermalnav/scan_mask", retained);
     explored_pub_ = create_publisher<Grid>("/thermalnav/explored", retained);
     inferred_pub_ = create_publisher<Grid>("/thermalnav/inferred", retained);
+    traversed_pub_ = create_publisher<Grid>("/thermalnav/verified_traversed", retained);
+    camera_free_pub_ = create_publisher<Grid>("/thermalnav/camera_observed_free", retained);
     render_pub_ = create_publisher<Image>("/thermalnav/bev/rendered", retained);
     cover_render_pub_ =
         create_publisher<Image>("/thermalnav/bev/coverage_rendered", retained);
@@ -97,8 +106,20 @@ public:
         create_publisher<std_msgs::msg::String>("/thermalnav/status", retained);
     goal_pub_ = create_publisher<Pose>("/goal_pose", 1);
     auto sensor = rclcpp::SensorDataQoS().keep_last(5);
+    if(external_perception_) {
+      thermal_info_sub_=create_subscription<sensor_msgs::msg::CameraInfo>("/thermalnav/thermal/camera_info",rclcpp::QoS(1).transient_local().reliable(),[this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m){thermal_info_=m;});
+      thermal_depth_sub_=create_subscription<Image>("/thermalnav/thermal/depth",rclcpp::QoS(5).reliable(),[this](Image::ConstSharedPtr m){thermal_depth_=m;});
+      thermal_tracks_sub_=create_subscription<std_msgs::msg::String>("/thermalnav/thermal/detections",retained,[this](std_msgs::msg::String::ConstSharedPtr m){
+        try{auto records=Json::parse(m->data);std::vector<Track> next;
+          for(const auto &r:records){next.push_back({r.at("id"),r.at("hits"),{r.at("xy")[0],r.at("xy")[1]},r.at("first"),r.at("last"),r.at("verified")});}
+          tracks_=std::move(next);
+        }catch(const Json::exception &e){RCLCPP_WARN(get_logger(),"Thermal record rejected: %s",e.what());}
+      });
+    }
     voxel_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "/thermalnav/occupied_voxels", retained);
+    obstacle_voxel_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/thermalnav/obstacle_voxels", retained);
     sparse_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         "/thermalnav/stereo/points", sensor,
         [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud) {
@@ -128,6 +149,7 @@ public:
         [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
           stereo_info_ = m;
         });
+    if(!external_perception_) {
     detection_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
         "/robot0/front_cam/camera_info", sensor,
         [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
@@ -142,8 +164,9 @@ public:
                                             if (rgbs_.size() > 15)
                                               rgbs_.pop_front();
                                           });
+    }
     depth_sub_ = create_subscription<Image>(
-        depth_topic_, sensor, [this](Image::ConstSharedPtr m) {
+        depth_topic_, rclcpp::QoS(5).reliable(), [this](Image::ConstSharedPtr m) {
           double s = stamp(m->header);
           if (last_received_stamp_ >= 0 && s < last_received_stamp_ - .5)
             resetEpoch(s);
@@ -175,9 +198,24 @@ public:
             certificate_status_ = "rejected: malformed attestation";
           }
         });
+    traversal_sub_=create_subscription<std_msgs::msg::String>(
+        "/thermalnav/safety/reply",retained,[this](std_msgs::msg::String::ConstSharedPtr m){
+          if(traversal_mode_!="sim_only_safety_oracle")return;
+          try {
+            auto reply=Json::parse(m->data);
+            if(reply.value("mode",std::string())!="sim_only_safety_oracle")return;
+            auto proof=reply.at("certificate");
+            double s=proof.at("stamp");
+            if(!odom_ || s<stamp(odom_->header)-1. || s>stamp(odom_->header)+.15)return;
+            traversal_proofs_.push_back(proof);
+            if(traversal_proofs_.size()>20)traversal_proofs_.pop_front();
+            processTraversal();
+          } catch(const Json::exception &) {}
+        });
     start_srv_ = create_service<Trigger>(
         "/thermalnav/start", [this](const std::shared_ptr<Trigger::Request>,
                                     std::shared_ptr<Trigger::Response> res) {
+          if(external_manager_){res->success=false;res->message="Navigation is owned by the separate baseline manager";return;}
           enabled_ = true;
           ++generation_;
           res->success = true;
@@ -201,7 +239,7 @@ public:
                 get_node_base_interface()->get_context()->get_domain_id(),
                 mapping_source_.c_str());
     RCLCPP_INFO(get_logger(), "C++ runtime; detector: %s; policy: %s",
-                detector_.name.c_str(), policy_.status.c_str());
+        external_perception_?"external thermal proxy detector via ROS":detector_.name.c_str(), external_manager_?"external baseline manager":policy_.status.c_str());
   }
   ~Demo() override {
     if (detection_.valid())
@@ -219,6 +257,8 @@ private:
     return {odom_->pose.pose.position.x, odom_->pose.pose.position.y};
   }
   void resetEpoch(double s) {
+    last_thermal_stamp_=-1;
+    thermal_depth_.reset();
     last_received_stamp_ = s;
     sparse_frames_.clear();
     depth_frames_.clear();
@@ -231,6 +271,8 @@ private:
     detection_depth_.reset();
     rgbs_.clear();
     odoms_.clear();
+    traversal_proofs_.clear();
+    last_traversal_stamp_=-1;
     tracks_.clear();
     proof_ = Json();
     if (reset_map_) {
@@ -256,6 +298,19 @@ private:
     RCLCPP_WARN(get_logger(), "Simulation time rewound; reset_map=%s",
                 reset_map_ ? "true" : "false");
   }
+  void processTraversal() {
+    if(!odom_)return;
+    for(auto it=traversal_proofs_.begin();it!=traversal_proofs_.end();) {
+      double s=it->at("stamp").get<double>();
+      if(s<=last_traversal_stamp_ || s<stamp(odom_->header)-1.) {it=traversal_proofs_.erase(it);continue;}
+      auto pose=std::find_if(odoms_.begin(),odoms_.end(),[&](const auto &o){return std::abs(stamp(o->header)-s)<1e-5;});
+      if(pose==odoms_.end()){++it;continue;}
+      auto p=(*pose)->pose.pose.position;
+      traversal_status_=bev_.recordVerifiedTraversal(*it,{p.x,p.y},stamp((*pose)->header));
+      last_traversal_stamp_=s;
+      it=traversal_proofs_.erase(it);
+    }
+  }
   void onOdom(Odom::ConstSharedPtr m) {
     const auto &p = m->pose.pose.position;
     const auto &q = m->pose.pose.orientation;
@@ -279,6 +334,7 @@ private:
     odoms_.push_back(m);
     if (odoms_.size() > 200)
       odoms_.pop_front();
+    processTraversal();
     if (waiting_reset_odom_) {
       waiting_reset_odom_ = false;
       cancel();
@@ -296,6 +352,13 @@ private:
       if (bev_.inside(c))
         bev_.visits(c) = std::min(65535, int(bev_.visits(c)) + 1);
     }
+    // Publish the live endpoint at odometry rate, independently of mapping.
+    // Keep the original history/visit sampling unchanged.
+    auto live_path=trajectory_;
+    live_path.header=m->header;
+    if(!live_path.poses.empty()&&stamp(live_path.poses.back().header)!=stamp(m->header))
+      live_path.poses.push_back(pose);
+    path_pub_->publish(live_path);
   }
   void process() {
     if (detection_.valid() && detection_.wait_for(std::chrono::seconds(0)) ==
@@ -312,9 +375,11 @@ private:
 
     launchDetection();
     auto camera = mapping_source_ == "stereo_only" ? stereo_info_ : info_;
-    if (!camera || !odom_ || odoms_.empty())
-
+    if (!camera || !odom_ || odoms_.empty()) {
+      blocked_ = !camera ? "waiting for mapping CameraInfo"
+                        : "waiting for mapping odometry";
       return;
+    }
     Image::ConstSharedPtr m = pending_;
     sensor_msgs::msg::PointCloud2::ConstSharedPtr sparse;
     if (mapping_source_ == "stereo_only") {
@@ -449,22 +514,36 @@ private:
         sparse_points = readPoints(*sparse);
         observation.points = sparse_points;
         stereo_count = observation.points.size();
-        observations.push_back(std::move(observation));
+        if (stereo_count)
+          observations.push_back(std::move(observation));
       }
       bev_.diagnostics = fusion_->integrate(observations, bev_);
+      std::vector<cv::Vec3d> completion;
+      for(const auto &observation:observations) for(const auto &sample:observation.points) {
+        if(!sample.floor_reliable || sample.confidence<.6)continue;
+        auto p=observation.R*sample.p+observation.origin;
+        auto h=p[2]-floor_;
+        if(std::abs(h)<=.06 || (h>.12 && h<=fusion_->options().max_height)) completion.push_back(p);
+      }
+      bev_.nearfield_stats=bev_.complete(completion,robot());
+      bev_.diagnostics["verified_traversed_cells"]=cv::countNonZero(bev_.traversed);
+      bev_.diagnostics["traversal_validation"]=traversal_status_;
+      bev_.diagnostics["ground_supported_but_unknown_cells"]=cv::countNonZero((bev_.floor_evidence!=0)&(bev_.occupancy()==255));
       bev_.diagnostics["depth_pixels"] = depth.total();
       bev_.diagnostics["valid_depth"] = valid_depth;
       bev_.diagnostics["stereo_points"] = stereo_count;
       bev_.diagnostics["stereo_status"] =
           mapping_source_ == "depth_only" ? "disabled"
-          : sparse                        ? "paired"
+          : stereo_count                  ? "paired"
+          : sparse                        ? "zero_valid_matches: depth-only fallback"
                                           : "unavailable: depth-only fallback";
+      bev_.diagnostics["fused_two_sources"] = valid_depth > 0 && stereo_count > 0;
       // Coverage belongs to the inspection (stereo/thermal-proxy) camera.
       // A wider, separately mounted depth camera cannot certify that coverage.
-      if (mapping_source_ != "stereo_only" &&
+      if (!external_perception_ && mapping_source_ != "stereo_only" &&
           (stereo_info_ && stereo_info_->header.frame_id == m->header.frame_id))
         bev_.observeCoverage(measured, K, R, t, floor_, max_range_);
-      else if (sparse && stereo_info_ &&
+      else if (!external_perception_ && sparse && stereo_info_ &&
                stereo_info_->header.frame_id == sparse->header.frame_id) {
         cv::Matx33d sk;
         std::copy(stereo_info_->k.begin(), stereo_info_->k.end(), sk.val);
@@ -519,6 +598,7 @@ private:
   }
 
   void launchDetection() {
+    if(external_perception_)return;
     if (rgbs_.empty() || detection_.valid() || wall() - last_detect_wall_ < 2 ||
         !detection_info_ || !detection_depth_)
       return;
@@ -649,6 +729,17 @@ private:
   }
   void tick() {
     double now = wall();
+    if(external_perception_ && thermal_depth_ && thermal_info_ && bev_.frames &&
+       rclcpp::Time(thermal_depth_->header.stamp).nanoseconds()>last_thermal_stamp_) {
+      auto m=thermal_depth_;auto info=thermal_info_;
+      if(m->header.frame_id==info->header.frame_id && m->width==info->width && m->height==info->height)try {
+        auto tr=tf_.lookupTransform("odom",m->header.frame_id,rclcpp::Time(m->header.stamp));
+        auto q=tr.transform.rotation;auto t=tr.transform.translation;cv::Matx33d k;std::copy(info->k.begin(),info->k.end(),k.val);
+        cv::Mat1f depth=cv_bridge::toCvCopy(m,"32FC1")->image;
+        bev_.observeCoverage(depth,k,rotation(q.x,q.y,q.z,q.w),{t.x,t.y,t.z},floor_,6.);
+        last_thermal_stamp_=rclcpp::Time(m->header.stamp).nanoseconds();
+      }catch(const std::exception &e){RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),10000,"Thermal coverage waiting: %s",e.what());}
+    }
     std::optional<PolicyResult> reply;
     if (decision_.valid() && decision_.wait_for(std::chrono::seconds(0)) ==
                                  std::future_status::ready) {
@@ -797,18 +888,30 @@ private:
       return;
     }
 
-    std::vector<DepthPoint> occupied;
+    std::vector<DepthPoint> occupied, obstacles;
     for (auto it = fusion_->tree().begin_leafs();
          it != fusion_->tree().end_leafs(); ++it)
-      if (it->getOccupancy() >= .65)
+      if (it->getOccupancy() >= .65) {
         occupied.push_back({{it.getX(), it.getY(), it.getZ()},
                             float(it->getOccupancy()),
                             0,
                             false});
+        const auto &options = fusion_->options();
+        if (it.getZ() >= options.floor + options.min_height &&
+            it.getZ() <= options.floor + options.max_height)
+          obstacles.push_back(occupied.back());
+      }
     voxel_pub_->publish(pointCloud(occupied, map_header_));
+    obstacle_voxel_pub_->publish(pointCloud(obstacles, map_header_));
     auto occ = bev_.occupancy();
     map_pub_->publish(grid(occ));
+    cv::Mat1b traversed(occ.size(),uint8_t(255)),camera_free(occ.size(),uint8_t(255));
+    traversed.setTo(0,(bev_.traversed!=0)&(occ!=100));
+    camera_free.setTo(0,(bev_.seen!=0)&(bev_.log<0));
+    traversed_pub_->publish(grid(traversed));
+    camera_free_pub_->publish(grid(camera_free));
     cover_pub_->publish(grid(bev_.coverage(tracks_)));
+    cv::Mat1b mask(occ.size(),uint8_t(255));mask.setTo(0,occ==0);mask.setTo(100,(occ==0)&(bev_.scanned!=0));scan_mask_pub_->publish(grid(mask));
     cv::Mat1b explored(occ.size(), uint8_t(255)),
         inferred(occ.size(), uint8_t(255));
     explored.setTo(50, bev_.inferred);
@@ -816,8 +919,6 @@ private:
     inferred.setTo(50, bev_.inferred);
     explored_pub_->publish(grid(explored));
     inferred_pub_->publish(grid(inferred));
-    trajectory_.header = odom_->header;
-    path_pub_->publish(trajectory_);
     double hfov = bev_.blind_zone.value("hfov_deg", 47.);
     auto image =
         renderer_.render(bev_, robot(), yaw(), trajectoryXY(), candidates_,
@@ -870,7 +971,11 @@ private:
         scanned = cv::countNonZero((occ == 0) & (bev_.scanned != 0));
     Json status = {
         {"runtime", "cpp"},
+        {"external_perception", external_perception_},
+        {"external_manager", external_manager_},
+        {"thermal_coverage_stamp_ns", last_thermal_stamp_},
         {"mapping_source", mapping_source_},
+        {"verified_traversal_mode",traversal_mode_},
         {"mapping_depth_dropout", dropout_},
         {"mapping_depth_noise_sigma", noise_},
         {"state", state_},
@@ -912,6 +1017,7 @@ private:
         {"candidates", candidates_.size()},
         {"blocked", blocked_}};
     std_msgs::msg::String m;
+    if(external_perception_)for(auto &target:status["targets"]){target["label"]="suspected_person";target["source"]="thermal_proxy_threshold";}
     m.data = status.dump();
     status_pub_->publish(m);
   }
@@ -924,6 +1030,7 @@ private:
   std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> sparse_frames_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sparse_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr voxel_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_voxel_pub_;
 
   Renderer renderer_;
   tf2_ros::Buffer tf_;
@@ -966,11 +1073,18 @@ private:
       cmd_speed_{}, cmd_time_{}, cancel_until_{};
   double last_decision_{}, last_goal_wall_{}, last_progress_wall_{},
       started_wall_{}, best_{1e9};
+  bool external_perception_{false},external_manager_{false};
+  int64_t last_thermal_stamp_{-1};
+  Image::ConstSharedPtr thermal_depth_;
+  sensor_msgs::msg::CameraInfo::ConstSharedPtr thermal_info_;
+  rclcpp::Subscription<Image>::SharedPtr thermal_depth_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr thermal_info_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr thermal_tracks_sub_;
   bool enabled_{true}, reset_map_{true}, waiting_reset_odom_{false},
       usable_depth_{false};
   std::string state_{"EXPLORE"}, blocked_{"waiting for sensors"},
       certificate_status_{"unavailable"};
-  rclcpp::Publisher<Grid>::SharedPtr map_pub_, cover_pub_, explored_pub_,
+  rclcpp::Publisher<Grid>::SharedPtr map_pub_, cover_pub_, scan_mask_pub_, explored_pub_,
       inferred_pub_;
   rclcpp::Publisher<Image>::SharedPtr render_pub_, cover_render_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
@@ -982,7 +1096,12 @@ private:
   rclcpp::Subscription<Image>::SharedPtr rgb_sub_, depth_sub_;
   rclcpp::Subscription<Odom>::SharedPtr odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr cert_sub_;
+  rclcpp::Publisher<Grid>::SharedPtr traversed_pub_,camera_free_pub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr cert_sub_,traversal_sub_;
+  std::deque<Json> traversal_proofs_;
+  std::string traversal_mode_;
+  double last_traversal_stamp_{-1};
+  Json traversal_status_=Json::object();
   rclcpp::Service<Trigger>::SharedPtr start_srv_, stop_srv_;
   rclcpp::TimerBase::SharedPtr process_timer_, tick_timer_;
 };

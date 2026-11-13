@@ -140,6 +140,7 @@ private:
                    {grid.info.origin.position.x, grid.info.origin.position.y});
       estimate.log = cv::Mat1f(grid.info.height, grid.info.width, 0.f);
       estimate.seen = cv::Mat1b(grid.info.height, grid.info.width, uint8_t(0));
+      estimate.traversed = estimate.seen.clone(); // Imported grids carry no traversal provenance.
       for (uint32_t y = 0; y < grid.info.height; ++y)
         for (uint32_t x = 0; x < grid.info.width; ++x) {
           int v = grid.data[y * grid.info.width + x];

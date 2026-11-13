@@ -50,12 +50,12 @@ public:
       throw std::invalid_argument("invalid duration, distance or timeout");
     auto sensor = rclcpp::SensorDataQoS();
     auto retained = rclcpp::QoS(1).transient_local().reliable();
-    rgb_sub_ = create_subscription<Image>("/robot0/front_cam/rgb", sensor,
+    rgb_sub_ = create_subscription<Image>("/robot0/front_cam/rgb", rclcpp::QoS(5).reliable(),
                                           [this](Image::ConstSharedPtr m) {
                                             rgb_ = m;
                                             ++rgb_count_;
                                           });
-    depth_sub_ = create_subscription<Image>("/robot0/front_cam/depth", sensor,
+    depth_sub_ = create_subscription<Image>("/robot0/front_cam/depth", rclcpp::QoS(5).reliable(),
                                             [this](Image::ConstSharedPtr m) {
                                               depth_ = m;
                                               ++depth_count_;
@@ -104,7 +104,13 @@ public:
           } catch (const Json::exception &) {
           }
         });
-    if (task_ == "manual-check")
+    thermal_status_sub_ = create_subscription<std_msgs::msg::String>(
+        "/thermalnav/thermal/status", retained,
+        [this](std_msgs::msg::String::ConstSharedPtr m){try{thermal_status_=Json::parse(m->data);}catch(const Json::exception &) {}});
+    detector_status_sub_ = create_subscription<std_msgs::msg::String>(
+        "/thermalnav/thermal/detector_status", retained,
+        [this](std_msgs::msg::String::ConstSharedPtr m){try{detector_status_=Json::parse(m->data);}catch(const Json::exception &) {}});
+    if (task_ == "manual-check" || task_ == "stop-goal")
       goal_pub_ = create_publisher<Pose>("/goal_pose", 1);
     if (task_ == "validate") {
       start_ = create_client<Trigger>("/thermalnav/start");
@@ -112,6 +118,18 @@ public:
     }
   }
   int run() {
+    if(task_=="wait-stop" || task_=="stop-goal") {
+      if(task_=="stop-goal") {
+        if(!wait([&]{return odom_ && wall()-odom_wall_<2 && goal_pub_->get_subscription_count()>0;},5)) {
+          std::cout<<"FAIL cannot cancel without fresh odom and PointGoal subscriber\n";return 1;
+        }
+        Pose goal;goal.header=odom_->header;goal.pose=odom_->pose.pose;goal_pub_->publish(goal);
+      }
+      double began=wall();
+      bool stopped=wait([&]{return cmd_wall_>=began && std::isfinite(cmd_speed_) && cmd_speed_<.02;},10);
+      std::cout<<(stopped?"PASS ":"FAIL ")<<"fresh SRU zero command\n";
+      return stopped?0:1;
+    }
     if (task_ == "doctor")
       return doctor();
     if (task_ == "startup-audit") {
@@ -256,12 +274,19 @@ private:
               << "cmd_vel publishers=" << publishers.size() << '\n';
     std::cout
         << "Go2: keep use_sim_time=false; stamped TF uses sensor timestamps.\n";
+    if(status_.value("external_perception",false)) {
+      for(const auto &entry:std::vector<std::pair<std::string,Json>>{{"synthetic_thermal",thermal_status_},{"thermal_proxy_detector",detector_status_}}){
+        bool ready=entry.second.value("processed_frames",0)>0 && entry.second.value("frame_age_s",1e9)<5;
+        ok &= ready;std::cout<<(ready?"PASS ":"FAIL ")<<entry.first<<' '<<entry.second.dump()<<'\n';
+      }
+    }
     return ok && !interrupted ? 0 : 1;
   }
   int manualCheck() {
     if (!wait(
             [this] {
               return odom_ && wall() - odom_wall_ < 2 &&
+                     wall() - cmd_wall_ < 2 && std::isfinite(cmd_speed_) &&
                      goal_pub_->get_subscription_count() > 0;
             },
             15))
@@ -357,6 +382,7 @@ private:
   sensor_msgs::msg::CameraInfo::ConstSharedPtr info_;
   Odom::ConstSharedPtr odom_;
   Json status_ = Json::object();
+  Json thermal_status_=Json::object(),detector_status_=Json::object();
   int rgb_count_{}, depth_count_{}, info_count_{}, odom_count_{}, imu_count_{};
   double odom_wall_{}, cmd_wall_{}, status_wall_{}, cmd_speed_{};
   bool motion_started_{false};
@@ -366,6 +392,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr status_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr thermal_status_sub_,detector_status_sub_;
   rclcpp::Publisher<Pose>::SharedPtr goal_pub_;
   rclcpp::Client<Trigger>::SharedPtr start_, stop_;
 };

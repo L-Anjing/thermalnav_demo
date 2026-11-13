@@ -83,6 +83,7 @@ BEV::BEV(double resolution, double size, XY map_origin, double radius)
   scanned = seen.clone();
   inferred = seen.clone();
   floor_evidence = seen.clone();
+  traversed = seen.clone();
   visits = cv::Mat_<uint16_t>::zeros(n, n);
 }
 cv::Point BEV::cell(XY p) const {
@@ -113,7 +114,7 @@ void BEV::expand(const std::vector<cv::Vec3d> &points) {
   if (log.cols + left + right > 2000 || log.rows + top + bottom > 2000)
     throw std::runtime_error("map size limit exceeded (2000 cells per axis)");
   for (cv::Mat *m : std::vector<cv::Mat *>{&log, &seen, &scanned, &inferred,
-                                           &floor_evidence, &visits}) {
+                                           &floor_evidence, &traversed, &visits}) {
     cv::Mat padded;
     cv::copyMakeBorder(*m, padded, top, bottom, left, right,
                        cv::BORDER_CONSTANT, 0);
@@ -123,6 +124,7 @@ void BEV::expand(const std::vector<cv::Vec3d> &points) {
 }
 cv::Mat1b BEV::occupancy() const {
   cv::Mat1b out(log.size(), uint8_t(255));
+  out.setTo(0, traversed != 0);
   out.setTo(0, (seen != 0) & (log < 0));
   out.setTo(100, (seen != 0) & (log >= 0));
   return out;
@@ -299,6 +301,40 @@ Json BEV::blindZone(const cv::Matx33d &K, const cv::Matx33d &R,
           {"floor_blind_left_center_right_m", ranges}};
 }
 
+// A point proof certifies only the actual measured pose, never future path
+// centers. Store whole cells contained in that footprint; no interpolation.
+Json BEV::recordVerifiedTraversal(const Json &proof, XY actual, double pose_stamp) {
+  auto reject=[](const std::string &why){return Json{{"accepted",false},{"reason",why},{"added_cells",0}};};
+  try {
+    if(proof.at("mode")!="sim_only_safety_oracle" ||
+       proof.at("provider")!="thermalnav_physx_startup_v1" || proof.at("frame")!="odom")
+      return reject("wrong_provider_or_frame");
+    if(proof.at("collision_free")!=true || proof.at("ground_supported")!=true ||
+       proof.at("sim_pid").get<int>()<=0 || proof.at("query_count").get<int>()<9)
+      return reject("failed_physics_validation");
+    double stamp=proof.at("stamp"),radius=proof.at("radius");
+    XY center(proof.at("xy").at(0),proof.at("xy").at(1));
+    if(!std::isfinite(stamp)||!std::isfinite(pose_stamp)||std::abs(stamp-pose_stamp)>1e-5 ||
+       !std::isfinite(center.x)||!std::isfinite(center.y)||!std::isfinite(actual.x)||!std::isfinite(actual.y)||
+       cv::norm(center-actual)>.005 || !std::isfinite(radius)||radius<=0||radius>footprint+1e-9)
+      return reject("unmatched_actual_pose_or_extent");
+    int added=0,conflicts=0;
+    auto lo=cell(center-XY(radius,radius)),hi=cell(center+XY(radius,radius));
+    for(int y=lo.y;y<=hi.y;++y)for(int x=lo.x;x<=hi.x;++x){
+      if(!inside({x,y}))continue;
+      XY lower=origin+XY(x*res,y*res),upper=lower+XY(res,res);
+      bool contained=true;
+      for(XY corner:{lower,upper,XY(lower.x,upper.y),XY(upper.x,lower.y)})
+        contained &= cv::norm(corner-center)<=radius+1e-9;
+      if(!contained)continue;
+      if(seen(y,x)&&log(y,x)>=0){++conflicts;continue;}
+      if(!traversed(y,x)){traversed(y,x)=255;++added;}
+    }
+    return {{"accepted",true},{"mode","sim_only_safety_oracle"},{"stamp",stamp},
+            {"added_cells",added},{"obstacle_conflicts",conflicts}};
+  }catch(const Json::exception &){return reject("malformed_proof");}
+}
+
 bool BEV::acceptCertificate(const Json &proof, XY robot, double stamp) {
   auto reject = [&](const std::string &s) {
     certificate_rejection = s;
@@ -366,7 +402,7 @@ std::string BEV::footprintReason(XY p) const {
       }
       if (seen(y, x) && log(y, x) >= 0)
         return "occupied";
-      if (seen(y, x) && log(y, x) < 0)
+      if ((seen(y, x) && log(y, x) < 0) || traversed(y,x))
         continue;
       if (covered)
         continue;
@@ -397,8 +433,18 @@ std::string BEV::pathReason(const std::vector<XY> &path) const {
   return footprintReason(path.back());
 }
 
+Json frontierClusterSnapshot(const cv::Mat &stats,const cv::Mat &centres,XY origin,double resolution) {
+  Json out=Json::array();
+  for(int i=1;i<stats.rows;++i){
+    int cells=stats.at<int>(i,cv::CC_STAT_AREA);
+    out.push_back({{"round_cluster_index",i},{"xy",{origin.x+(centres.at<double>(i,0)+.5)*resolution,origin.y+(centres.at<double>(i,1)+.5)*resolution}},
+                   {"cells",cells},{"basic_filter",cells<4?"too_small":"passed"}});
+  }
+  return out;
+}
 std::vector<Candidate> BEV::candidates(XY robot, const std::vector<XY> &failed,
-                                       const std::vector<Track> &targets) {
+                                       const std::vector<Track> &targets,
+                                       bool nearest_baseline) {
   auto occ = occupancy();
   cv::Mat1b boundary, adjacent;
   cv::dilate(occ == 255, adjacent, cv::Mat1b::ones(3, 3));
@@ -407,6 +453,7 @@ std::vector<Candidate> BEV::candidates(XY robot, const std::vector<XY> &failed,
   int components =
       cv::connectedComponentsWithStats(boundary, labels, stats, centres, 8);
   frontier_components = components - 1;
+  frontier_observations=frontierClusterSnapshot(stats,centres,origin,res);
   rejections = {{"unknown_footprint", 0}, {"occupied", 0},
                 {"disconnected", 0},      {"no_safe_path", 0},
                 {"too_small", 0},         {"repeat_visit", 0}};
@@ -464,9 +511,18 @@ std::vector<Candidate> BEV::candidates(XY robot, const std::vector<XY> &failed,
     std::sort(order.begin(), order.end(), [&](auto a, auto b) {
       return cv::norm(XY(a) - anchor) < cv::norm(XY(b) - anchor);
     });
-    for (size_t j = 0; j < std::min(size_t(120), order.size()); ++j) {
+    const size_t limit=nearest_baseline && kind=="inspection_viewpoint" ? order.size() : std::min(size_t(120),order.size());
+    for (size_t j = 0; j < limit; ++j) {
       auto c = order[j];
       XY w = world(c);
+      if(nearest_baseline && kind=="inspection_viewpoint") {
+        double observation_distance=cv::norm(XY(c)-anchor)*res;
+        if(observation_distance<.9 || observation_distance>6.)continue;
+        bool visible=true;
+        for(auto v:ray(c,{cvRound(anchor.x),cvRound(anchor.y)}))
+          if(!inside(v) || occ(v)!=0){visible=false;break;}
+        if(!visible)continue;
+      }
       double cost = dist(c);
       if (cost < .85)
         continue;
@@ -475,7 +531,7 @@ std::vector<Candidate> BEV::candidates(XY robot, const std::vector<XY> &failed,
         rejections["repeat_visit"] = rejections["repeat_visit"].get<int>() + 1;
         continue;
       }
-      if (cv::norm(XY(c) - anchor) * res > 1.8) {
+      if (cv::norm(XY(c) - anchor) * res > (nearest_baseline && kind=="inspection_viewpoint"?6.:1.8)) {
         rejections["disconnected"] = rejections["disconnected"].get<int>() + 1;
         return;
       }
@@ -513,20 +569,21 @@ std::vector<Candidate> BEV::candidates(XY robot, const std::vector<XY> &failed,
     cv::Rect roi(std::max(0, cx - rad), std::max(0, cy - rad), 0, 0);
     roi.width = std::min(occ.cols, cx + rad + 1) - roi.x;
     roi.height = std::min(occ.rows, cy + rad + 1) - roi.y;
-    add("frontier", anchor, cv::countNonZero(occ(roi) == 255) * res * res);
+    add("frontier", anchor, nearest_baseline ? 0. : cv::countNonZero(occ(roi) == 255) * res * res);
   }
+  const bool have_frontier = !out.empty();
   int n = cv::connectedComponentsWithStats((occ == 0) & (scanned == 0), labels,
                                            stats, centres, 8);
   for (int lab = 1; lab < n; ++lab)
-    if (stats.at<int>(lab, cv::CC_STAT_AREA) >= 12)
+    if ((!nearest_baseline || !have_frontier) && stats.at<int>(lab, cv::CC_STAT_AREA) >= 12)
       add("inspection_viewpoint",
           {centres.at<double>(lab, 0), centres.at<double>(lab, 1)},
-          stats.at<int>(lab, cv::CC_STAT_AREA) * res * res);
+          nearest_baseline ? 0. : stats.at<int>(lab, cv::CC_STAT_AREA) * res * res);
   for (const auto &t : targets)
-    if (!t.verified)
+    if (!nearest_baseline && !t.verified)
       add("verify_target", XY(cell(t.xy)), 4., t.id);
-  std::stable_sort(out.begin(), out.end(), [](const auto &a, const auto &b) {
-    return a.score > b.score;
+  std::stable_sort(out.begin(), out.end(), [nearest_baseline](const auto &a, const auto &b) {
+    return nearest_baseline ? a.cost < b.cost : a.score > b.score;
   });
   if (out.size() > 24)
     out.resize(24);

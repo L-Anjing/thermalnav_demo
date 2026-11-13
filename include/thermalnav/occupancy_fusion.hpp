@@ -20,9 +20,10 @@ class OccupancyFusion {
 public:
   explicit OccupancyFusion(FusionOptions options = {});
   Json integrate(const std::vector<Observation> &observations, BEV &bev);
-  void project(BEV &bev) const;
+  Json project(BEV &bev) const;
   void clear();
   const octomap::OcTree &tree() const { return tree_; }
+  const FusionOptions &options() const { return options_; }
 
 private:
   FusionOptions options_;

@@ -1,0 +1,219 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Toolbars:
+  toolButtonStyle: 2
+Visualization Manager:
+  Class: ""
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Global Options:
+    Fixed Frame: odom
+    Frame Rate: 15
+    Background Color: 0; 0; 0
+  Displays:
+    - Class: rviz_default_plugins/Odometry
+      Name: Live Robot Odometry
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /robot0/odom
+        Reliability Policy: Reliable
+      Keep: 1
+      Position Tolerance: 0
+      Angle Tolerance: 0
+      Shape:
+        Value: Arrow
+        Color: 255; 45; 45
+        Alpha: 1
+        Axes Length: 0.5
+        Axes Radius: 0.05
+        Head Length: 0.15
+        Head Radius: 0.08
+        Shaft Length: 0.4
+        Shaft Radius: 0.04
+    - Class: rviz_default_plugins/Grid
+      Name: Metric Grid (1 m)
+      Enabled: true
+      Value: true
+      Reference Frame: <Fixed Frame>
+      Cell Size: 1
+      Plane Cell Count: 40
+      Alpha: 0.25
+      Color: 85; 87; 83
+      Offset:
+        Z: -0.03
+    - Class: rviz_default_plugins/Axes
+      Name: World Axes
+      Enabled: true
+      Value: true
+      Reference Frame: <Fixed Frame>
+      Length: 0.5
+      Radius: 0.025
+    - Class: rviz_default_plugins/TF
+      Name: TF (diagnostic)
+      Enabled: false
+      Value: false
+    - Class: rviz_default_plugins/Image
+      Name: RGB Camera
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /robot0/front_cam/rgb
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Image
+      Name: Semantic Synthetic Thermal (display only)
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /thermalnav/thermal/colorized
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Map
+      Name: Geometry Occupancy
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /thermalnav/bev
+        Durability Policy: Transient Local
+      Alpha: 1.0
+      Color Scheme: map
+    - Class: rviz_default_plugins/Map
+      Name: Thermal Scan Mask (toggle geometry off to view)
+      Enabled: false
+      Value: false
+      Topic:
+        Value: /thermalnav/scan_mask
+        Durability Policy: Transient Local
+      Alpha: 1.0
+      Color Scheme: map
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Frontier and Inspection Candidates
+      Enabled: false
+      Value: false
+      Topic:
+        Value: /thermalnav/baseline/candidates
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Pose
+      Name: Selected Waypoint
+      Enabled: false
+      Value: false
+      Topic:
+        Value: /thermalnav/baseline/selected_goal
+        Durability Policy: Transient Local
+      Color: 255; 220; 0
+    - Class: rviz_default_plugins/Path
+      Name: Robot Trajectory
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /thermalnav/trajectory
+        Durability Policy: Transient Local
+      Color: 0; 80; 255
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Thermal Proxy Person Candidates
+      Enabled: false
+      Value: false
+      Topic:
+        Value: /thermalnav/thermal/markers
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Occupied surfaces - 3D (includes floor)
+      Enabled: false
+      Value: false
+      Topic:
+        Value: /thermalnav/occupied_voxels
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Position Transformer: XYZ
+      Color Transformer: AxisColor
+      Axis: Z
+      Style: Points
+      Size (Pixels): 3
+      Size (m): 0.05
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Collision-height obstacles - 3D
+      Enabled: false
+      Value: false
+      Topic:
+        Value: /thermalnav/obstacle_voxels
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Position Transformer: XYZ
+      Color Transformer: AxisColor
+      Axis: Z
+      Style: Points
+      Size (Pixels): 3
+      Size (m): 0.05
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Decision Space - raw reachable rejected selected labels
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /thermalnav/exploration/markers
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Path
+      Name: Validated Candidate Path (not SRU trajectory prediction)
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /thermalnav/exploration/selected_path
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Color: 180; 65; 255
+      Line Style: Lines
+      Line Width: 0.05
+    - Class: rviz_default_plugins/Image
+      Name: BEV Decision Image (independent preview)
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /thermalnav/bev/decision_image
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+  Views:
+    Current:
+      Class: rviz_default_plugins/XYOrbit
+      Name: Current View
+      Distance: 18
+      Focal Point: {X: 2, Y: 0, Z: 0}
+      Pitch: 0.95
+      Yaw: 0.8
+      Target Frame: <Fixed Frame>
+      Near Clip Distance: 0.01
+    Saved:
+      - Class: rviz_default_plugins/TopDownOrtho
+        Name: 2D BEV - top down
+        Scale: 50
+        Angle: 0
+        X: 2
+        Y: 0
+        Target Frame: <Fixed Frame>
+      - Class: rviz_default_plugins/XYOrbit
+        Name: 3D Occupancy - orbit
+        Distance: 18
+        Focal Point: {X: 2, Y: 0, Z: 0}
+        Pitch: 0.65
+        Yaw: 0.8
+        Target Frame: <Fixed Frame>
+Window Geometry:
+  Baseline IntentNav-style BEV:
+    collapsed: true
+  Thermal plane coverage (separate image):
+    collapsed: true
+  Tool Properties:
+    collapsed: true
+  Selection:
+    collapsed: true
+  Width: 1500
+  Height: 950
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd000000020000000000000140000003a5fc0200000007fb00000014005200470042002000430061006d0065007200610100000011000000a90000001700fffffffb0000005200530065006d0061006e007400690063002000530079006e00740068006500740069006300200054006800650072006d0061006c002000280064006900730070006c006100790020006f006e006c0079002901000000c0000000aa0000001700fffffffb000000380042006100730065006c0069006e006500200049006e00740065006e0074004e00610076002d007300740079006c006500200042004500560000000000ffffffff0000001700fffffffb0000004e0054006800650072006d0061006c00200070006c0061006e006500200063006f007600650072006100670065002000280073006500700061007200610074006500200069006d00610067006500290000000000ffffffff0000001700fffffffb000000100044006900730070006c0061007900730100000170000002460000001700fffffffb0000001e0054006f006f006c002000500072006f00700065007200740069006500730000000000ffffffff0000001700fffffffb0000001200530065006c0065006300740069006f006e0000000000ffffffff0000001700ffffff000000010000010e000003a5fc0200000001fb0000000a005600690065007700730100000011000003a50000001700ffffff00000382000003a500000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000

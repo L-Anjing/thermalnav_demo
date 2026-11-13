@@ -291,3 +291,37 @@ TEST(Policy, MissingServiceHasExplicitFallback) {
   EXPECT_NE(p.status.find("VLM unavailable"), std::string::npos);
   EXPECT_EQ(p.calls, 0u);
 }
+
+TEST(Map, TraversalRequiresExactExecutedPoseAndPhysicsProof) {
+  BEV b; auto p=proof();p["mode"]="sim_only_safety_oracle";
+  EXPECT_FALSE(b.recordVerifiedTraversal(p,{1,0},1.)["accepted"].get<bool>());
+  EXPECT_FALSE(b.recordVerifiedTraversal(p,{0,0},1.01)["accepted"].get<bool>());
+  p["ground_supported"]=false;
+  EXPECT_FALSE(b.recordVerifiedTraversal(p,{0,0},1.)["accepted"].get<bool>());
+  EXPECT_EQ(cv::countNonZero(b.traversed),0);
+  p["ground_supported"]=true;
+  EXPECT_TRUE(b.recordVerifiedTraversal(p,{0,0},1.)["accepted"].get<bool>());
+  EXPECT_GT(cv::countNonZero(b.traversed),0);
+  EXPECT_EQ(cv::countNonZero(b.seen),0);
+  EXPECT_EQ(cv::countNonZero(b.floor_evidence),0);
+  EXPECT_EQ(cv::countNonZero(b.scanned),0);
+  EXPECT_EQ(b.occupancy()(b.cell({.15,.05})),0);
+  EXPECT_EQ(b.occupancy()(b.cell({.45,.05})),255);
+  for(int y=0;y<b.log.rows;++y)for(int x=0;x<b.log.cols;++x)if(b.traversed(y,x)) {
+    auto lo=b.origin+XY(x*b.res,y*b.res);
+    for(XY c:{lo,lo+XY(b.res,0),lo+XY(0,b.res),lo+XY(b.res,b.res)})EXPECT_LE(cv::norm(c),.35+1e-9);
+  }
+  // Disjoint actual states do not certify the unsampled gap between them.
+  p["xy"]={2.,0.};p["stamp"]=2.;b.recordVerifiedTraversal(p,{2,0},2.);
+  EXPECT_EQ(b.occupancy()(b.cell({1.,0.})),255);
+}
+TEST(Map, TraversalNeverOverridesObstacleAndSurvivesExpansion) {
+  BEV b;auto p=proof();p["mode"]="sim_only_safety_oracle";
+  auto c=b.cell({.05,.05});b.seen(c)=255;b.log(c)=3;
+  b.recordVerifiedTraversal(p,{0,0},1.);
+  EXPECT_EQ(b.occupancy()(c),100);
+  EXPECT_FALSE(b.traversed(c));
+  b.expand({{-20,-20,0}});
+  EXPECT_TRUE(b.traversed(b.cell({-.15,-.05})));
+  EXPECT_EQ(b.occupancy()(b.cell({.05,.05})),100);
+}

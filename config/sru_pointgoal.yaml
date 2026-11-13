@@ -1,0 +1,11 @@
+# Deterministic deployment of the sru_test PointGoal baseline.
+# Original: b2w_navigation_ppo/2026-10-27_01-22-52_b2w_ppo_full/model_5000.pt
+# The training environment randomizes noise, delay, action bias/scales and filter
+# coefficients. This profile uses nominal settings; it does not reproduce an
+# entire randomized B2W simulation episode on Go2.
+navigation_policy_node:
+  ros__parameters:
+    control_frequency: 5.0
+    lateral_velocity_scale: 1.0
+    command_filter_coef: [0.5, 0.5, 0.5]
+    goal_z_mode: base

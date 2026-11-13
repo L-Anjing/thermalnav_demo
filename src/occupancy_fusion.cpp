@@ -60,7 +60,8 @@ Json OccupancyFusion::integrate(const std::vector<Observation> &observations,
   };
   std::map<Key, Evidence, KeyLess> batch;
   Json sources = Json::object();
-  size_t rejected = 0;
+  size_t rejected = 0, ground_points=0, obstacle_points=0, ray_misses=0, blocked_rays=0;
+
   std::vector<cv::Vec3d> extent;
   for (const auto &observation : observations) {
     if (observation.source.empty() || !std::isfinite(observation.stamp) ||
@@ -111,6 +112,8 @@ Json OccupancyFusion::integrate(const std::vector<Observation> &observations,
                                    int(std::floor(p[1] / options_.resolution)));
         ground_[cell] = std::max(ground_[cell], weight);
       }
+      if (std::abs(p[2]-options_.floor)<=.06 && sample.floor_reliable) ++ground_points;
+      if(p[2]>options_.floor+options_.min_height && p[2]<=options_.floor+options_.max_height) ++obstacle_points;
       ++accepted;
     }
     std::map<Key, Evidence, KeyLess> local;
@@ -127,6 +130,15 @@ Json OccupancyFusion::integrate(const std::vector<Observation> &observations,
           if (w.z() < options_.floor - .2 || w.z() > options_.floor + 2.5)
             continue;
           local[k].miss = std::max(local[k].miss, weight);
+          ++ray_misses;
+          // Stop at a measured surface or a previously reliable occupied voxel.
+          // The blocker itself may receive clearing evidence over later frames;
+          // its occluded continuation receives none in this frame.
+          auto known=tree_.search(k);
+          if(endpoints.count(k) || (known && known->getOccupancy()>=.65)) {
+            ++blocked_rays;
+            break;
+          }
         }
     }
     // One update per source/voxel/frame. Multiple sources are capped below,
@@ -152,56 +164,75 @@ Json OccupancyFusion::integrate(const std::vector<Observation> &observations,
     tree_.updateNode(key, e.hit > 0 ? .85f * e.hit : -.4f * e.miss, true);
   }
   tree_.updateInnerOccupancy();
-  project(bev);
+  auto previous=bev.occupancy();
+  auto projection=project(bev);
   auto occ = bev.occupancy();
-  return {{"sources", sources},
+  return {{"sources", sources},{"projection",projection},
           {"updated_voxels", batch.size()},
+          {"ground_points",ground_points},{"obstacle_points",obstacle_points},
+          {"ray_free_voxel_visits",ray_misses},{"occlusion_stopped_rays",blocked_rays},
+          {"new_free_cells",cv::countNonZero((occ==0)&(previous!=0))},
+          {"new_occupied_cells",cv::countNonZero((occ==100)&(previous!=100))},
+          {"free_to_unknown_cells",cv::countNonZero((previous==0)&(occ==255))},
           {"voxel_nodes", tree_.size()},
           {"conflicting_voxels", conflicts},
           {"rejected_points", rejected},
+          {"ground_supported_columns", ground_.size()},
+          {"collision_height_m", {options_.min_height, options_.max_height}},
+          {"floor_height_m", options_.floor},
           {"free_cells", cv::countNonZero(occ == 0)},
           {"occupied_cells", cv::countNonZero(occ == 100)},
           {"observed_cells", cv::countNonZero(bev.seen)}};
 }
-void OccupancyFusion::project(BEV &bev) const {
+Json OccupancyFusion::project(BEV &bev) const {
+  // Occupied hysteresis: a single miss must not erase a reliable obstacle.
+  // Retain it while its 3-D evidence is uncertain; repeated misses below the
+  // existing free threshold clear it. An empty tree (epoch reset) clears all.
+  cv::Mat1b previous_occupied=(bev.seen!=0)&(bev.log>=0);
   bev.log.setTo(0);
   bev.seen.setTo(0);
   bev.floor_evidence.setTo(0);
   for (auto it = tree_.begin_leafs(); it != tree_.end_leafs(); ++it) {
     if (it.getZ() < options_.floor + options_.min_height ||
-        it.getZ() > options_.floor + options_.max_height ||
-        it->getOccupancy() < .65)
+        it.getZ() > options_.floor + options_.max_height)
       continue;
     auto cell = bev.cell({it.getX(), it.getY()});
-    if (!bev.inside(cell))
-      continue;
+    if (!bev.inside(cell)) continue;
+    if(it->getOccupancy()<.65 && !(previous_occupied(cell) && it->getOccupancy()>=.45))continue;
     bev.log(cell) = 3;
     bev.seen(cell) = 255;
     bev.inferred(cell) = 0;
   }
+  int missing_clearance=0,uncertain_clearance=0,occupied_ground=0,free_ground=0;
   for (const auto &[key, weight] : ground_) {
     XY p((key.first + .5) * options_.resolution,
          (key.second + .5) * options_.resolution);
     auto cell = bev.cell(p);
-    if (!bev.inside(cell) || bev.log(cell) > 0)
-      continue;
-    bool all_free = true;
+    if (!bev.inside(cell)) continue;
+    bev.floor_evidence(cell)=255; // Ground evidence exists even if upper clearance is unknown.
+    if (bev.log(cell) > 0) {++occupied_ground;continue;}
+    bool all_free = true,missing=false,uncertain=false;
     int first = int(std::ceil(options_.min_height / options_.resolution - .5));
     int last =
         int(std::floor(options_.max_height / options_.resolution - .5 + 1e-6));
     for (int i = first; i <= last; ++i) {
       auto node = tree_.search(p.x, p.y,
                                options_.floor + (i + .5) * options_.resolution);
-      if (!node || node->getOccupancy() > .45) {
-        all_free = false;
-        break;
-      }
+      if(!node){missing=true;all_free=false;}
+      else if(node->getOccupancy()>.45){uncertain=true;all_free=false;}
     }
+    if(missing)++missing_clearance;
+    else if(uncertain)++uncertain_clearance;
     if (all_free) {
+      ++free_ground;
       bev.log(cell) = -3;
       bev.seen(cell) = bev.floor_evidence(cell) = 255;
     }
   }
+  return {{"ground_with_unobserved_clearance",missing_clearance},
+          {"ground_with_uncertain_clearance",uncertain_clearance},
+          {"ground_with_occupied_clearance",occupied_ground},
+          {"camera_verified_free_columns",free_ground}};
 }
 Observation depthObservation(const cv::Mat1f &depth, const cv::Matx33d &K,
                              const cv::Matx33d &R, const cv::Vec3d &t,

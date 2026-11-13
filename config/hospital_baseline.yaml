@@ -1,0 +1,48 @@
+thermalnav_thermal:
+  ros__parameters:
+    camera_prefix: /robot0/front_cam
+    mode: ideal
+    seed: 42
+    person_response: 34.0
+    background_response: 20.0
+    wall_response: 20.0
+    floor_response: 19.0
+    furniture_response: 22.0
+    equipment_response: 27.0
+    noise_sigma: 0.25
+    blur_sigma: 0.8
+    downsample: 2
+    min_depth: 0.15
+    max_depth: 8.0
+    background_nonuniformity: 0.35
+    rgb_texture_amplitude: 0.2
+    person_spatial_amplitude: 0.6
+    challenging_contrast: 0.55
+    challenging_warm_offset: 1.0
+    display_min: 15.0
+    display_max: 40.0
+thermalnav_thermal_detector:
+  ros__parameters:
+    threshold: 30.0
+    min_area: 24
+    min_depth: 0.15
+    max_depth: 8.0
+    records_file: /tmp/thermalnav_baseline/detections.json
+thermalnav_baseline:
+  ros__parameters:
+    search_bounds: [-4.0, 15.0, -3.0, 9.0]
+    metrics_file: /tmp/thermalnav_baseline/metrics.csv
+    goal_timeout: 90.0
+    progress_timeout: 15.0
+    footprint_radius: 0.35
+    auto_start: true
+    initial_observation_seconds: 10.0
+    # Execution/cooldown budgets use odometry simulation time; freshness uses wall time.
+    max_search_sim_seconds: 300.0
+    initial_stage: frontier
+    publish_decisions: true
+thermalnav_decision_visualizer:
+  ros__parameters:
+    enabled: true
+    update_hz: 2.0
+    label_limit: 12

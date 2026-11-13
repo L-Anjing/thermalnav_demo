@@ -25,11 +25,14 @@ public:
     auto right_info_topic = declare_parameter<std::string>(
         "right_info_topic", "/robot0/front_cam_right/camera_info");
     auto qos = rclcpp::SensorDataQoS().keep_last(8);
+    // Isaac ROS2CameraHelper publishes reliable, fragmented megapixel images.
+    // Best-effort readers lose complete frames when any UDP fragment is lost.
+    auto images = rclcpp::QoS(8).reliable();
     auto retained = rclcpp::QoS(1).transient_local().reliable();
     left_sub_ = create_subscription<Image>(
-        left_topic, qos, [this](Image::ConstSharedPtr m) { push(left_, m); });
+        left_topic, images, [this](Image::ConstSharedPtr m) { push(left_, m); });
     right_sub_ = create_subscription<Image>(
-        right_topic, qos, [this](Image::ConstSharedPtr m) { push(right_, m); });
+        right_topic, images, [this](Image::ConstSharedPtr m) { push(right_, m); });
     left_info_sub_ = create_subscription<Info>(
         left_info_topic, qos,
         [this](Info::ConstSharedPtr m) { left_info_ = m; });
@@ -62,6 +65,9 @@ private:
     return rclcpp::Time(m.header.stamp).nanoseconds();
   }
   void push(std::deque<Image::ConstSharedPtr> &queue, Image::ConstSharedPtr m) {
+    const auto now = std::chrono::steady_clock::now();
+    if (&queue == &left_) { ++received_left_; left_wall_ = now; }
+    else { ++received_right_; right_wall_ = now; }
     auto &previous =
         &queue == &left_ ? last_left_received_ : last_right_received_;
     if (previous >= 0 && stamp(*m) < previous - 500000000LL) {
@@ -158,7 +164,10 @@ private:
       right_rectified_info_->publish(ri);
       last_ = stamp(*l);
       ++pairs_;
-      reason_.clear();
+      reason_ = result.points.empty()
+                    ? (diagnostics_.value("features", 0) == 0
+                           ? "low_texture" : "zero_valid_matches")
+                    : "";
       while (!left_.empty() && stamp(*left_.front()) <= last_)
         left_.pop_front();
       while (!right_.empty() && stamp(*right_.front()) <= last_)
@@ -176,6 +185,23 @@ private:
     data["dropped_frames"] = dropped_;
     data["epoch"] = epoch_;
     data["blocked"] = reason_;
+    auto age = [](auto time) {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now() - time).count();
+    };
+    data["received_left"] = received_left_;
+    data["received_right"] = received_right_;
+    data["left_info_received"] = bool(left_info_);
+    data["right_info_received"] = bool(right_info_);
+    data["last_left_stamp_ns"] = last_left_received_;
+    data["last_right_stamp_ns"] = last_right_received_;
+    if (!received_left_) data["blocked"] = "missing_left_image";
+    else if (!received_right_) data["blocked"] = "missing_right_image";
+    else if (!left_info_) data["blocked"] = "missing_left_calibration";
+    else if (!right_info_) data["blocked"] = "missing_right_calibration";
+    else if (age(left_wall_) > 3) data["blocked"] = "left_stream_interrupted";
+    else if (age(right_wall_) > 3) data["blocked"] = "right_stream_interrupted";
+    if (received_left_) data["left_age_s"] = age(left_wall_);
+    if (received_right_) data["right_age_s"] = age(right_wall_);
     std_msgs::msg::String m;
     m.data = data.dump();
     status_->publish(m);
@@ -187,6 +213,8 @@ private:
   std::deque<Image::ConstSharedPtr> left_, right_;
   int64_t last_{-1}, last_left_received_{-1}, last_right_received_{-1};
   uint64_t pairs_{}, dropped_{}, epoch_{};
+  uint64_t received_left_{}, received_right_{};
+  std::chrono::steady_clock::time_point left_wall_, right_wall_;
   std::string reason_{"waiting for stereo cameras"};
   Json diagnostics_ = Json::object();
   rclcpp::Subscription<Image>::SharedPtr left_sub_, right_sub_;
